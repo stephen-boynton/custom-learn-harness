@@ -27,7 +27,8 @@ import { getGraph, mergeFindings, type DerivedGraph, type EmissionStats, type Gr
 import type { GraphStore } from "../../core/ports.ts";
 import { emit } from "../../core/events.ts";
 import { settleGraphLayout } from "../../core/layout-settle.ts";
-import { batchRuns, coverageOf, messageViewLines } from "../../core/coverage.ts";
+import { batchRuns, coverageOf, coverageSlots, messageViewLines } from "../../core/coverage.ts";
+import { extractionViewOf } from "../../core/check-view.ts";
 import { failedOutputCallIds, type LhMessage } from "../../core/native-messages.ts";
 import { auditorGraphTools } from "../tools/graph.ts";
 import { runSubmitAgent, healStringifiedArrays } from "./submit-agent.ts";
@@ -107,37 +108,32 @@ import { runSubmitAgent, healStringifiedArrays } from "./submit-agent.ts";
 // ─── the source view (what the extractor sees) ──────────────────────────────
 
 /**
- * The extraction view: the session as TEACHER PROSE ONLY (owner ruling,
+ * The extraction view: the session as the TEACHER'S PROSE (owner ruling,
  * 2026-09-28 — supersedes the 2026-09-27 whole-session markdown view),
- * each passage labeled with its actual message id (2026-10-13). The
- * shared markdown engine (core/session-markdown.ts) keeps the full session
- * format for the future user-facing export; the extractor no longer uses
- * it.
+ * each passage labeled with its actual message id (2026-10-13), plus the
+ * checks the teacher posed, as posed (ADR-0004 — partly reverses the
+ * 2026-09-28 ruling): context outside coverage, rendered by
+ * core/check-view.ts. No learner messages, thinking, results or other
+ * tool calls. The shared markdown engine (core/session-markdown.ts) keeps
+ * the full session format for the future user-facing export; the
+ * extractor does not use it.
  */
 
 /** The whole-record view (used by callers that render a full session;
- *  the pipeline itself batches). TEACHER PROSE ONLY (owner, 2026-09-28),
- *  passages labeled with their message ids (2026-10-13).
- */
+ *  the pipeline itself batches): every prose passage, and every posed
+ *  check that has a prose message at or after it to travel with. */
 export function transcriptView(record: ChatRecord): string {
-	return proseView(record.messages, record.title);
+	const slots = coverageSlots(record.messages);
+	const { viewOf } = extractionViewOf(record.messages, slots);
+	return renderView(viewOf(slots.filter((slot) => slot.tokens > 0)).lines, record.title);
 }
 
-/** The extraction view under the teacher-prose ruling (owner, 2026-09-28):
- *  ONLY learner-facing teacher prose (text or send_to_user) — no learner
- *  messages, thinking, other tool calls/results, or quiz blocks — labeled with
- *  its ACTUAL message id (owner, 2026-10-13): the view lines ARE
- *  core/coverage.ts messageViewLines ("TEACHER [id] text"), the exact
- *  lines the coverage fingerprints hash, so the extractor can anchor
- *  every proposition to the passage it came from (the session submit's
- *  required messageId). The shared markdown engine stays reserved for the
- *  future user-facing export. */
-function proseView(
-	messages: ReadonlyArray<LhMessage>,
-	title?: string,
-	failedOutputCalls: ReadonlySet<string> = failedOutputCallIds(messages),
-): string {
-	const lines = messages.flatMap((message) => messageViewLines(message, message.id, failedOutputCalls));
+/** The prompt document: the session title, then the view's passages and
+ *  check blocks separated by blank lines. The TEACHER [id] lines are
+ *  core/coverage.ts messageViewLines verbatim — the lines the coverage
+ *  fingerprints hash — so the extractor anchors every proposition to the
+ *  passage it came from (the session submit's required messageId). */
+function renderView(lines: ReadonlyArray<string>, title?: string): string {
 	const head = title && title.length > 0 ? `# ${title}\n\n` : "";
 	return head + lines.join("\n\n");
 }
@@ -388,10 +384,21 @@ function fillAudit(raw: Static<typeof auditSchema>): AuditVerdicts {
 export const SESSION_MESSAGE_ID_RULE =
 	"For each new proposition, copy the message ID of the passage that most directly states or explains it into messageId.";
 
+/** The session-only checks rule (ADR-0004, #8 — drafted, pending owner
+ *  review): CHECK blocks (core/check-view.ts) are context, never a
+ *  source — the graph is still built from teaching alone, and anchors
+ *  still name TEACHER passages (validateSessionAnchors). What the
+ *  extractor does WITH a check (attribution) is #9's to add. */
+export const SESSION_CHECKS_RULE =
+	"Blocks labeled CHECK are questions the teacher posed to the learner, shown as posed, without the learner's " +
+	"answers. They are context only: never extract a proposition from a check, and messageId always names a " +
+	"TEACHER passage.";
+
 export const SESSION_PREAMBLE =
 	"You are the extraction stage of a learning application. You read one stretch of a source — a teaching " +
-	"session, rendered as the teacher's prose in reading order — and report what it teaches as findings " +
-	"for the learner's global knowledge graph, building on everything already extracted from this source.";
+	"session, rendered as the teacher's prose and the checks the teacher posed, in reading order — and report " +
+	"what it teaches as findings for the learner's global knowledge graph, building on everything already " +
+	"extracted from this source.";
 
 export const NOTES_PREAMBLE =
 	"You are the extraction stage of a learning application. You read one stretch of a source — the " +
@@ -432,7 +439,7 @@ reappear, by id, as a premise of later chains. A bare idea that no argument uses
 propositions list alone. Include every field even when empty — "chains": [] when the source makes no
 arguments. The tool's field descriptions carry the details.`;
 
-export const EXTRACTOR_INSTRUCTIONS = `${SESSION_PREAMBLE}\n\n${EXTRACTION_CORE}\n\n${SESSION_MESSAGE_ID_RULE}`;
+export const EXTRACTOR_INSTRUCTIONS = `${SESSION_PREAMBLE}\n\n${EXTRACTION_CORE}\n\n${SESSION_MESSAGE_ID_RULE}\n\n${SESSION_CHECKS_RULE}`;
 export const NOTES_EXTRACTOR_INSTRUCTIONS = `${NOTES_PREAMBLE}\n\n${EXTRACTION_CORE}`;
 
 // ── the same-source digest (owner, 2026-09-30 evening) ──
@@ -1123,10 +1130,13 @@ export function createExtractionPipeline(deps: ExtractionPipelineDeps): Extracti
 				return { nodes: 0, chains: 0 };
 			}
 			const chunkTokens = deps.getChunkTokens?.() ?? FACTORY_SETTINGS.graph.extractionChunkTokens;
-			// The batcher's one rule (owner, Wave D): a tool-call message and
-			// its result message(s) are INSEPARABLE — one chunk, covered
-			// together, read together (core/coverage.ts batchRuns).
-			const batches = batchRuns(covered.slots, covered.uncovered, chunkTokens);
+			// Batches are runs of uncovered teacher-prose messages
+			// (core/coverage.ts batchRuns). Posed checks ride along as
+			// context outside coverage (ADR-0004, core/check-view.ts): each
+			// travels with its own message's prose, or the next prose after
+			// it, and weighs on the fill budget only.
+			const extraction = extractionViewOf(record.messages, covered.slots, failedOutputCalls);
+			const batches = batchRuns(covered.slots, covered.uncovered, chunkTokens, extraction.extraTokens);
 			console.info(
 				`[extraction ${chatId}] pipeline start — ${covered.uncoveredTokens} uncovered tok, ` +
 					`${covered.uncoveredCount} messages, ${batches.length} batch(es) of ≤${chunkTokens} tok`,
@@ -1147,13 +1157,13 @@ export function createExtractionPipeline(deps: ExtractionPipelineDeps): Extracti
 					settled.push({
 						status: "fulfilled",
 						value: await runJob({ id: chatId, kind: "chat", part }, async (jobKey) => {
-							// The batch's source view: TEACHER PROSE ONLY (owner,
-							// 2026-09-28), each passage labeled with its ACTUAL message
-							// id (2026-10-13) — the view lines ARE the coverage
-							// fingerprints' messageViewLines ("TEACHER [id] text"), one
-							// shared seam.
+							// The batch's source view: the teacher's prose, each passage
+							// labeled with its ACTUAL message id (2026-10-13) in exactly
+							// the lines the coverage fingerprints hash ("TEACHER [id]
+							// text"), plus the checks travelling with it as posed
+							// (ADR-0004: "CHECK q1 [id]" blocks, context only).
 							const messages = batch.map((slot) => slot.message);
-							const view = proseView(messages, record.title, failedOutputCalls);
+							const view = renderView(extraction.viewOf(batch).lines, record.title);
 							// The batch's teacher-prose ids — the ONLY anchors this
 							// job's submit may name (validateSessionAnchors at the
 							// submit seam refuses anything else: ids from other
@@ -1185,10 +1195,12 @@ export function createExtractionPipeline(deps: ExtractionPipelineDeps): Extracti
 									gone.name = "AbortError";
 									throw gone;
 								}
-								// The batch's messages, snapshotted when the run computed
-								// coverage — if a message mutates mid-run (a quiz answer
-								// merges in), the stored fingerprint won't match its new
-								// one and it re-opens: honest by construction.
+								// The batch's prose messages, snapshotted when the run
+								// computed coverage — if one's teacher prose changes
+								// mid-run, the stored fingerprint won't match its new one
+								// and it re-opens: honest by construction. (Answers never
+								// re-open anything: a result is invisible to coverage, and
+								// the checks travelling with the batch get no row.)
 								const foldedAt = new Date().toISOString();
 								const batchStats = mergeFindings(chatId, findings, auditResult, { chatStore, graphStore }, {
 									foldedAt,
