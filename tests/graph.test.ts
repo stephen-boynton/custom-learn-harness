@@ -668,12 +668,37 @@ describe("graph ledger store", () => {
 			at: "2026-10-27T00:00:00.000Z",
 		};
 		const attribution = { type: "attribution" as const, toolCallId: "call-store", keyPointId: "k1", propositionId: "n_x", at: "2026-10-27T00:01:00.000Z", runId: "run_store" };
+		const run = { type: "attributionRun" as const, toolCallId: "call-store", runId: "run_store", at: "2026-10-27T00:01:00.000Z" };
 		graphStore.appendEvidence(answer);
-		fs.appendFileSync(LEDGER_FILES.evidence, `{torn\n${JSON.stringify({ type: "answer", toolCallId: "bad" })}\n`, "utf-8");
+		fs.appendFileSync(LEDGER_FILES.evidenceAnswers, `{torn\n${JSON.stringify({ type: "answer", toolCallId: "bad" })}\n`, "utf-8");
+		graphStore.appendEvidence(run);
 		graphStore.appendEvidence(attribution);
 		graphStore.rewriteLedgers({ nodes: [], chains: [], coverage: [], checkpoints: [] });
-		assert.deepEqual(graphStore.readEvidence().filter((e) => e.toolCallId !== "bad"), [answer, attribution]);
-		assert.equal(graphStore.readEvidence().length, 2, "malformed lines are skipped");
+		assert.deepEqual(graphStore.readEvidence().filter((e) => e.toolCallId !== "bad"), [answer, run, attribution]);
+		assert.equal(graphStore.readEvidence().length, 3, "malformed lines are skipped");
+	});
+
+	it("the evidence ledger is split by writer: answers in evidence-answers.jsonl, attributions and runs in evidence.jsonl", () => {
+		const fileLines = (file: string) => (fs.existsSync(file) ? fs.readFileSync(file, "utf-8").split("\n").filter(Boolean) : []);
+		const before = { answers: fileLines(LEDGER_FILES.evidenceAnswers).length, attributions: fileLines(LEDGER_FILES.evidence).length };
+		graphStore.appendEvidence({
+			type: "answer",
+			toolCallId: "call-split",
+			chatId: "chat_c",
+			questionMessageId: "a1",
+			answerMessageId: "r1",
+			kind: "recognition",
+			phase: "teach",
+			dontKnow: false,
+			correct: true,
+			at: "2026-10-27T00:00:00.000Z",
+		});
+		graphStore.appendEvidence({ type: "attributionRun", toolCallId: "call-split", runId: "run_split", at: "2026-10-27T00:01:00.000Z" });
+		graphStore.appendEvidence({ type: "attribution", toolCallId: "call-split", propositionId: "n_x", runId: "run_split", at: "2026-10-27T00:01:00.000Z" });
+		const answers = fileLines(LEDGER_FILES.evidenceAnswers).slice(before.answers).map((l) => JSON.parse(l).type);
+		const attributions = fileLines(LEDGER_FILES.evidence).slice(before.attributions).map((l) => JSON.parse(l).type);
+		assert.deepEqual(answers, ["answer"]);
+		assert.deepEqual(attributions, ["attributionRun", "attribution"]);
 	});
 });
 

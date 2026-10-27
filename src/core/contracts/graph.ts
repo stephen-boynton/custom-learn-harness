@@ -291,7 +291,7 @@ export interface SessionFindings {
 	checkedCalls?: string[];
 }
 
-// ─── The evidence ledger (spec #2, ADR-0002 — evidence.jsonl) ───────────────
+// ─── The evidence ledger (spec #2, ADR-0002 — evidence.jsonl + evidence-answers.jsonl)
 //
 // Append-only, NEVER rewritten (not part of rewriteLedgers). Three kinds of
 // entry (answer, attribution, attribution run), all keyed by the question's

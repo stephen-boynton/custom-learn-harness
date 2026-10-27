@@ -344,6 +344,8 @@ Sub-agents **verify, never one-shot**: the demo-builder headlessly executes its 
 
 **The extraction pipeline is the sole graph writer.** Nothing else appends to `data/graph/*.jsonl` — not the teacher, not the server, not a migration script. (The one sanctioned exception: `PUT /api/graph/positions` writes layout positions only, sanitized, with an incremental layout settle when the graph grew. Backfill scripts bypass this by design, as one-time operations.)
 
+**Recorded exception — the evidence ledger (ADR-0002, spec #2).** The learner's evidence sits *beside* the graph in `data/graph/`, and it has two writers — one per file, never two on one file (owner ruling, evidence-ledger code review): the chat handler appends **answer** entries to `evidence-answers.jsonl` when an answer is saved (graded first, for free recall); the merger appends **attribution** and **attribution-run** entries to `evidence.jsonl` when a batch merges. Neither file is ever rewritten (no `rewriteLedgers` key, untouched by deletions); held status is derived from both on every read (`core/evidence.ts`) and never written to a node.
+
 ```mermaid
 flowchart TB
     TRIG["trigger seam (turn-service): coverageOf(record, coverageLedger)<br/>— uncovered tokens ≥ graph.extractionChunkTokens (settings)?"] -->|"yes, single-flight per source"| RUN["extraction.runExtraction(chatId)"]
@@ -464,7 +466,7 @@ For ordinary Next web/dev, `src/server/web-subscriptions.ts` composes these same
 | Law |
 |---|
 | **One composition root per concern** — `stores.ts` (storage), `chat-handler.ts` (a turn) |
-| **One writer per ledger** — the merger is the sole graph writer; chat records written only by the turn pipeline; job records only by the runner; positions PUT is the only sanctioned graph-adjacent exception |
+| **One writer per ledger** — the merger is the sole graph writer; chat records written only by the turn pipeline; job records only by the runner; positions PUT is a sanctioned graph-adjacent exception, and so is the evidence ledger (ADR-0002): answer entries in `evidence-answers.jsonl` written only by the chat handler, attribution entries in `evidence.jsonl` only by the merger — one writer per file (§6) |
 | **The store never decides** — adapters persist and shape-guard; merge/dedup/derivation semantics are reader-side, in core |
 | **Derived, never dual-tracked** — append-only evidence; every state recomputed at read (snapshot, plan statuses, phases, costs, coverage) |
 | **Idempotency via deterministic keys** — steer ids, ledger refs, coverage fingerprints, source content fingerprints, cluster content hashes; re-running anything converges |

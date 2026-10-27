@@ -67,10 +67,14 @@ export const LEDGER_FILES = {
 	 *  the checkpoint's replacement for chat extractions — notes keep
 	 *  sessions.jsonl, whole-file as they are). */
 	coverage: path.join(PATHS.graph, "coverage.jsonl"),
-	/** The evidence ledger (contracts/graph.ts EvidenceEntry, spec #2):
-	 *  answers and attributions, append-only and NEVER rewritten — it has
-	 *  no rewriteLedgers key. */
+	/** The evidence ledger (contracts/graph.ts EvidenceEntry, spec #2),
+	 *  append-only and NEVER rewritten — neither file has a rewriteLedgers
+	 *  key. Split by writer (owner, code review — one writer per file):
+	 *  attribution and attribution-run entries, written only by the
+	 *  extraction merger… */
 	evidence: path.join(PATHS.graph, "evidence.jsonl"),
+	/** …and answer entries, written only by the chat handler. */
+	evidenceAnswers: path.join(PATHS.graph, "evidence-answers.jsonl"),
 } as const;
 
 /**
