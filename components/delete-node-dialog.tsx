@@ -26,7 +26,22 @@ export const EXTRACTION_RETRY_LINE = "An extraction is running — try again whe
  *
  * WORDING: "node"/"nodes" — THE UI word for graph objects (owner
  * ruling, same day, standardized everywhere in the UI).
+ *
+ * THE EVIDENCE LINE (spec #2 / #12, owner 2026-10-27): the one fact
+ * added back — how many pieces of evidence (answers attributed to the
+ * node) the deletion orphans; a multi-selection shows the total. The
+ * count rides on the graph snapshot the caller already holds
+ * (`evidenceCount`), so the 2026-09-30 ruling's point stands: NO
+ * pre-flight fetch, no flicker.
  */
+
+/** The evidence line's copy — exported pure for pins. */
+export function evidenceLine(nodeCount: number, evidence: number): string {
+	const subject = nodeCount === 1 ? "This node carries" : `These ${nodeCount} nodes carry`;
+	const amount = evidence === 0 ? "no evidence" : evidence === 1 ? "1 piece of evidence" : `${evidence} pieces of evidence`;
+	return `${subject} ${amount}.`;
+}
+
 /** The dialog's pure body — exported for SSR pins (the settings-dialog
  *  body pattern). The wrapper owns state + effects + the portal. */
 export function DeleteNodeBody({
@@ -38,8 +53,8 @@ export function DeleteNodeBody({
 }: {
 	/** One node (the canvas context menu) or many (the chain table's
 	 *  selection). One names it alone; many pluralize the title and
-	 *  list the names. */
-	nodes: { id: string; name: string }[];
+	 *  list the names. `evidenceCount` comes off the graph snapshot. */
+	nodes: { id: string; name: string; evidenceCount: number }[];
 	busy: boolean;
 	failure: { code: string; error: string } | null;
 	onClose: () => void;
@@ -82,6 +97,12 @@ export function DeleteNodeBody({
 				{nodes.length === 1
 					? "This permanently deletes the node — this cannot be undone."
 					: `This permanently deletes all ${nodes.length} nodes — this cannot be undone.`}
+			</p>
+			<p className="mt-1 text-sm text-muted-foreground" data-testid="node-evidence-line">
+				{evidenceLine(
+					nodes.length,
+					nodes.reduce((sum, n) => sum + n.evidenceCount, 0),
+				)}
 			</p>
 			{failure && (
 				<div
@@ -138,8 +159,8 @@ export function DeleteNodeDialog({
 	/** The nodes up for deletion; null/empty = closed. One (the canvas
 	 *  context menu) or many (the chain table's selection). Names from
 	 *  the client's snapshot — what the user sees is what the dialog
-	 *  names. */
-	nodes: { id: string; name: string }[] | null;
+	 *  names, and the evidence counts it shows. */
+	nodes: { id: string; name: string; evidenceCount: number }[] | null;
 	onClose: () => void;
 	/** Success path — the callers announce lh:graph-revision so the
 	 *  snapshot refetches. The deleted ids ride along so

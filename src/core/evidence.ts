@@ -132,6 +132,12 @@ export interface EvidenceView {
 	/** Answers no attribution points at (glossary: unattached evidence) —
 	 *  the extractor-health signal. */
 	unattached: AnswerEntry[];
+	/** How many answers are attributed to a node — each answer once,
+	 *  however many of its key points name the node, whatever its verdict
+	 *  (#12: the delete dialog's count, carried on the graph snapshot). An
+	 *  id no node has any more counts its orphaned evidence; callers ask
+	 *  only about live nodes. */
+	answerCountOf(nodeId: string): number;
 }
 
 /** Imported-notes source ids are "src_" + a path hash (the notes front
@@ -206,6 +212,7 @@ export function evidenceView(entries: ReadonlyArray<EvidenceEntry>): EvidenceVie
 
 	return {
 		unattached,
+		answerCountOf: (nodeId) => evidenceOf.get(nodeId)?.length ?? 0,
 		statusOf(node: GraphNode): PropositionEvidence {
 			const list = evidenceOf.get(node.id) ?? [];
 			for (let i = list.length - 1; i >= 0; i--) {

@@ -429,6 +429,15 @@ export interface GraphSnapshot {
 	 * nodes are never partitioned. Purely provenance-derived — never
 	 * depends on layout. */
 	clusters: Cluster[];
+	/** nodeId → how many answers are attributed to the proposition (each
+	 *  answer once, latest attribution only — #11's newest-run rule
+	 *  applies). Propositions with none are absent: read `?? 0`. The delete
+	 *  dialog's count (#12) — on the snapshot so the dialog never fetches. */
+	evidenceCount: Record<string, number>;
+	/** How many answers are attributed to no proposition (glossary:
+	 *  unattached evidence) — the extractor-health measure. Not shown to
+	 *  the prober. */
+	unattachedEvidence: number;
 	/** Resting layout positions per node id, when a positions ledger
 	 *  exists (core/layout.ts settle writes it). Absent on a fresh graph —
 	 *  the view then falls back to its own one-shot forceAtlas2 pass. */

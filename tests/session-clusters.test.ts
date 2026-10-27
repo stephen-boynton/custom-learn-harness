@@ -59,6 +59,7 @@ function fakeStores(
 			(over.sources ?? []).map((s) => ({ ...s, extractions: [] }) as unknown as NotesSource),
 		readPositions: () => ({}),
 		writePositions: () => {},
+		readEvidence: () => [],
 	} as unknown as GraphStore;
 	const chatStore: ChatStore = {
 		listChats: () =>

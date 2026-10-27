@@ -58,9 +58,10 @@ import {
 	EXTRACTOR_INSTRUCTIONS,
 	NOTES_EXTRACTOR_INSTRUCTIONS,
 } from "../src/agent/subagents/extraction.ts";
-import { getGraph, simplifyChains } from "../src/core/graph.ts";
+import { getGraph, graphSnapshot, simplifyChains } from "../src/core/graph.ts";
 import { proberGraphTools } from "../src/agent/tools/graph.ts";
 import { evidenceView } from "../src/core/evidence.ts";
+import { deleteNodeTraces } from "../src/core/graph-deletion.ts";
 import { ModelsNotConfiguredError, ProviderKeyMissingError, providerKeyMissing, type ModelSlotName } from "../src/core/settings.ts";
 import { coverageOf, coverageSlots, messageViewLines } from "../src/core/coverage.ts";
 import { chatStore } from "../src/store/chats.ts";
@@ -3387,5 +3388,132 @@ describe("recognition and prediction answers as evidence (#10)", () => {
 			assert.equal(a.toolCallId, "call-mc");
 			assert.equal(a.keyPointId, undefined, "the whole check — no key point");
 		}
+	});
+});
+
+// ─── evidence survives graph edits; the snapshot carries its count (#12) ────
+//
+// Seam 2 again (real chat store, in-memory ledgers, scripted extractor and
+// auditor), read through the prober's list_propositions and the graph
+// snapshot the delete dialog reads (no fetch, owner 2026-10-27).
+
+/** An auditor step linking the given local ids to existing nodes. */
+function linkingAuditStep(links: Array<{ id: string; linkTo: string }>): FauxResponseStep {
+	return () =>
+		fauxAssistantMessage(
+			[fauxToolCall("submit_review", { links } as unknown as ToolCall["arguments"], { id: "review-call" })],
+			{ stopReason: "toolUse" },
+		);
+}
+
+const nodeNamed = (ledgers: ReturnType<typeof memoryLedgers>, name: string) => getGraph(ledgers).nodes.find((n) => n.name === name)!;
+
+describe("evidence survives graph edits; the snapshot carries its count (#12)", () => {
+	it("the snapshot counts the answers attributed to each node, and the unattached answers", async () => {
+		const { chatId } = checksChat("Count fixture", [
+			...assistant("a1", [{ type: "text", text: "Heat flows from hot to cold by collisions until equilibrium." }, threePointCheck("call-first")]),
+			user("u1", "ok"),
+			...assistant("a2", [{ type: "text", text: "Again, later." }, threePointCheck("call-later", "Once more: how does heat move?")]),
+			user("u2", "ok"),
+			...assistant("a3", [{ type: "text", text: "And one nobody attributes." }, threePointCheck("call-loose", "Why does heat stop?")]),
+		]);
+		const ledgers = memoryLedgers();
+		ledgers.appendEvidence(productionAnswer(chatId, "call-first", "2026-10-20T09:00:00.000Z", { k1: "present", k2: "absent", k3: "present" }));
+		ledgers.appendEvidence(productionAnswer(chatId, "call-later", "2026-10-21T09:00:00.000Z", { k1: "present", k2: "present", k3: "present" }));
+		ledgers.appendEvidence(productionAnswer(chatId, "call-loose", "2026-10-22T09:00:00.000Z", { k1: "present", k2: "present", k3: "present" }));
+		await extractWith(chatId, ledgers, [
+			attributingStep(HEAT_PROPOSITIONS, [
+				// Two key points of one answer on the same idea: ONE answer.
+				{ check: "q1", keyPoint: "k1", propositions: ["p1"] },
+				{ check: "q1", keyPoint: "k3", propositions: ["p1", "p3"] },
+				{ check: "q2", keyPoint: "k1", propositions: ["p1"] },
+			]),
+		]);
+
+		const snapshot = graphSnapshot({ chatStore, graphStore: ledgers });
+		const count = (name: string) => snapshot.evidenceCount[nodeNamed(ledgers, name).id] ?? 0;
+		assert.equal(count("Heat flows hot to cold"), 2, "two answers, however many key points");
+		assert.equal(count("Thermal equilibrium"), 1);
+		assert.equal(count("Collisions carry heat"), 0, "no answer attributed");
+		assert.equal(snapshot.unattachedEvidence, 1, "call-loose is attributed to nothing");
+	});
+
+	it("evidence on a proposition the auditor links to an existing node counts toward that surviving node", async () => {
+		// Session A teaches the idea first; session B's check tests it again,
+		// and the auditor identifies B's proposition with A's node.
+		const first = checksChat("Merge fixture A", [...assistant("a1", [{ type: "text", text: "Heat flows from hot to cold." }])]);
+		const ledgers = memoryLedgers();
+		await extractWith(first.chatId, ledgers, [attributingStep(HEAT_PROPOSITIONS.slice(0, 1), [])]);
+		const surviving = nodeNamed(ledgers, "Heat flows hot to cold");
+
+		const second = checksChat("Merge fixture B", [
+			...assistant("a1", [{ type: "text", text: "Heat moves from the hotter body to the colder one." }, threePointCheck("call-merged")]),
+		]);
+		ledgers.appendEvidence(productionAnswer(second.chatId, "call-merged", "2026-10-26T09:00:00.000Z", { k1: "present", k2: "absent", k3: "absent" }));
+		await createExtractionPipeline({
+			chatStore,
+			graphStore: ledgers,
+			extractor: fauxEngine([attributingStep(HEAT_PROPOSITIONS.slice(0, 1), [{ check: "q1", keyPoint: "k1", propositions: ["p1"] }])]),
+			auditor: fauxEngine([linkingAuditStep([{ id: "p1", linkTo: surviving.id }])]),
+		}).runExtraction(second.chatId);
+
+		assert.equal(getGraph(ledgers).nodes.length, 1, "linked, not duplicated");
+		assert.match(await listPropositions(ledgers, first.chatId), /^- Heat flows hot to cold — held \(2026-10-26\)$/m);
+		assert.equal(graphSnapshot({ chatStore, graphStore: ledgers }).evidenceCount[surviving.id], 1);
+	});
+
+	it("re-extracting a session links its propositions back to their nodes, and the evidence stays on them", async () => {
+		const { chatId } = checksChat("Re-extraction fixture", [
+			...assistant("a1", [{ type: "text", text: "Heat flows from hot to cold." }, threePointCheck("call-heat")]),
+		]);
+		const ledgers = memoryLedgers();
+		ledgers.appendEvidence(productionAnswer(chatId, "call-heat", "2026-10-20T09:00:00.000Z", { k1: "present", k2: "absent", k3: "absent" }));
+		const attribution = [{ check: "q1", keyPoint: "k1", propositions: ["p1"] }];
+		await extractWith(chatId, ledgers, [attributingStep(HEAT_PROPOSITIONS.slice(0, 1), attribution)]);
+		const node = nodeNamed(ledgers, "Heat flows hot to cold");
+
+		const reRun: string[] = [];
+		// A teacher-prose edit re-opens the message; the re-run's auditor
+		// identifies the proposition with the node it already became.
+		chatStore.saveMessages(
+			chatId,
+			chatStore.getChat(chatId)!.messages.map((m) =>
+				(m as { id?: string }).id === "a1"
+					? ({ ...m, content: [{ type: "text", text: "Heat flows from hot to cold, always." }, ...(m as { content: unknown[] }).content.slice(1)] } as never)
+					: m,
+			),
+		);
+		await createExtractionPipeline({
+			chatStore,
+			graphStore: ledgers,
+			extractor: fauxEngine([attributingStep(HEAT_PROPOSITIONS.slice(0, 1), attribution, (v) => reRun.push(v))]),
+			auditor: fauxEngine([linkingAuditStep([{ id: "p1", linkTo: node.id }])]),
+		}).runExtraction(chatId);
+
+		assert.equal(reRun.length, 1, "the re-opened message was extracted again");
+		assert.equal(getGraph(ledgers).nodes.length, 1, "the same node, not a copy");
+		assert.match(await listPropositions(ledgers, chatId), /^- Heat flows hot to cold — held \(2026-10-20\)$/m);
+		assert.equal(graphSnapshot({ chatStore, graphStore: ledgers }).evidenceCount[node.id], 1, "one answer, counted once");
+	});
+
+	it("deleting a node leaves its evidence in the ledger, orphaned: counted toward no status, and not unattached", async () => {
+		const { chatId } = checksChat("Deletion fixture", [
+			...assistant("a1", [{ type: "text", text: "Heat flows from hot to cold by collisions until equilibrium." }, threePointCheck("call-heat")]),
+		]);
+		const ledgers = memoryLedgers();
+		ledgers.appendEvidence(productionAnswer(chatId, "call-heat", "2026-10-20T09:00:00.000Z", { k1: "present", k2: "contradicted", k3: "absent" }));
+		await extractWith(chatId, ledgers, [attributingStep(HEAT_PROPOSITIONS, PER_POINT)]);
+		const dead = nodeNamed(ledgers, "Heat flows hot to cold");
+		const before = ledgers.readEvidence();
+
+		assert.ok(deleteNodeTraces(ledgers, dead.id));
+
+		assert.deepEqual(ledgers.readEvidence(), before, "the ledger is never rewritten by a deletion");
+		const out = await listPropositions(ledgers, chatId);
+		assert.ok(!out.includes("Heat flows hot to cold"), "the dead node is gone");
+		assert.match(out, /^- Collisions carry heat — misconception \(2026-10-20\)$/m, "the answer's other evidence still counts");
+		const snapshot = graphSnapshot({ chatStore, graphStore: ledgers });
+		assert.equal(snapshot.evidenceCount[dead.id], undefined, "orphaned evidence is counted nowhere");
+		assert.equal(snapshot.unattachedEvidence, 0, "orphaned is not unattached: the answer was attributed");
 	});
 });
