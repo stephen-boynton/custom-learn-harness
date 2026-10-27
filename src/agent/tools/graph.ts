@@ -77,7 +77,7 @@ export function proberGraphTools(ctx: GraphToolContext): Record<string, AgentToo
 			description:
 				"List the propositions BORN in one knowledge-graph session, each with his status and the day of its latest evidence: " +
 				"held (his latest free-recall answer showed it), misconception (that answer contradicted it), " +
-				"not held (he missed it or said he didn't know), covered only (taught, never shown) or encountered only (from his notes, never shown). " +
+				"not held (he missed it, picked a wrong multiple-choice answer, or said he didn't know), covered only (taught, never shown) or encountered only (from his notes, never shown). " +
 				"Only held means he has shown it. " +
 				"Names only — no statement text, no answer text (owner ruling 2026-09-23: the map's ORGANIZATION is your business, its prose is not).",
 			parameters: listPropositionsInput,

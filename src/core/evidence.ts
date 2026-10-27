@@ -25,9 +25,12 @@
  *                 count against every proposition attributed to the
  *                 question).
  * A RECOGNITION answer (#10) takes its place in that same order but can
- * only count against: a wrong one, or "I don't know", is not held until a
- * later production pass; a correct one says nothing. A PREDICTION never
- * moves status, right or wrong (owner, 2026-10-27).
+ * never make held: a wrong one, or "I don't know", is not held until a
+ * later production pass; a correct one that is the latest recognition
+ * evidence, with no production evidence since, CLEARS an earlier wrong one
+ * back to covered only / encountered only (owner, after #10) — otherwise
+ * it says nothing. A PREDICTION never moves status, right or wrong
+ * (owner, 2026-10-27).
  * No production evidence: covered only (some chat provenance) or
  * encountered only (notes provenance alone).
  *
@@ -145,12 +148,12 @@ export interface EvidenceView {
  *  door, agent/subagents/extraction.ts) — everything else is a chat. */
 const isNotesSourceId = (id: string): boolean => id.startsWith("src_");
 
-/** What one answer says about one proposition, or undefined when it says
- *  nothing (an uncertain verdict, a correct recognition answer, any
- *  prediction). */
-function outcomeOf(answer: AnswerEntry, keyPointIds: ReadonlyArray<string | undefined>): HeldStatus | undefined {
-	// Recognition can count against held, never make it (#10).
-	if (answer.kind === "recognition") return answer.dontKnow || answer.correct === false ? "not_held" : undefined;
+/** What one answer says about one proposition: a status, "recovered" (a
+ *  correct recognition answer — it can clear an earlier wrong one, never
+ *  make held), or undefined when it says nothing (an uncertain verdict,
+ *  any prediction). */
+function outcomeOf(answer: AnswerEntry, keyPointIds: ReadonlyArray<string | undefined>): HeldStatus | "recovered" | undefined {
+	if (answer.kind === "recognition") return answer.dontKnow || answer.correct === false ? "not_held" : "recovered";
 	if (answer.kind !== "production") return undefined;
 	if (answer.dontKnow) return "not_held";
 	const v = answer.verdict;
@@ -218,14 +221,21 @@ export function evidenceView(entries: ReadonlyArray<EvidenceEntry>): EvidenceVie
 		unattached,
 		answerCountOf: (nodeId) => evidenceOf.get(nodeId)?.length ?? 0,
 		statusOf(node: GraphNode): PropositionEvidence {
+			const noEvidence = (): PropositionEvidence => ({
+				status: node.provenance.some((pt) => !isNotesSourceId(pt.chatId)) ? "covered_only" : "encountered_only",
+			});
 			const list = evidenceOf.get(node.id) ?? [];
+			// Newest first. A correct recognition answer with no production
+			// evidence since clears the wrong recognition answer before it.
+			let recovered = false;
 			for (let i = list.length - 1; i >= 0; i--) {
 				const { answer, keyPointIds } = list[i]!;
 				const status = outcomeOf(answer, keyPointIds);
-				if (status) return { status, latestAt: answer.at };
+				if (status === "recovered") recovered = true;
+				else if (status && recovered && answer.kind === "recognition") return noEvidence();
+				else if (status) return { status, latestAt: answer.at };
 			}
-			const covered = node.provenance.some((pt) => !isNotesSourceId(pt.chatId));
-			return { status: covered ? "covered_only" : "encountered_only" };
+			return noEvidence();
 		},
 	};
 }

@@ -3363,6 +3363,46 @@ describe("recognition and prediction answers as evidence (#10)", () => {
 		assert.match(await listPropositions(ledgers, chatId), /^- Heat flows hot to cold — not held \(2026-10-23\)$/m);
 	});
 
+	it("a later correct recognition answer clears an earlier wrong one back to covered only — never to held", async () => {
+		const { chatId } = checksChat("MC recovery fixture", [
+			...assistant("a1", [{ type: "text", text: "Heat flows from hot to cold by collisions until equilibrium." }, heatChoiceCheck("call-mc-1")]),
+			user("u1", "ok"),
+			...assistant("a2", [{ type: "text", text: "Now say it in your own words." }, threePointCheck("call-recall", "In your words: how does heat move?")]),
+			user("u2", "ok"),
+			...assistant("a3", [{ type: "text", text: "Once more, pick one." }, heatChoiceCheck("call-mc-2")]),
+		]);
+		const attributions = [
+			{ check: "q1", propositions: ["p1"] },
+			{ check: "q2", keyPoint: "k1", propositions: ["p1"] },
+			{ check: "q3", propositions: ["p1"] },
+		];
+		for (const [label, held] of [
+			["wrong then correct", false],
+			["held, then wrong, then correct", true],
+		] as const) {
+			const ledgers = memoryLedgers();
+			if (held) ledgers.appendEvidence(productionAnswer(chatId, "call-recall", "2026-10-20T09:00:00.000Z", { k1: "present", k2: "absent", k3: "absent" }));
+			ledgers.appendEvidence(choiceAnswer(chatId, "call-mc-1", "2026-10-21T09:00:00.000Z", false));
+			ledgers.appendEvidence(choiceAnswer(chatId, "call-mc-2", "2026-10-22T09:00:00.000Z", true));
+			await extractWith(chatId, ledgers, [attributingStep(HEAT_PROPOSITIONS.slice(0, 1), attributions)]);
+			assert.match(await listPropositions(ledgers, chatId), /^- Heat flows hot to cold — covered only$/m, label);
+		}
+	});
+
+	it("a correct recognition answer clears neither a production miss nor a production pass", async () => {
+		for (const [label, statuses, expected] of [
+			["miss", { k1: "absent", k2: "absent", k3: "absent" }, /^- Heat flows hot to cold — not held \(2026-10-21\)$/m],
+			["pass", { k1: "present", k2: "absent", k3: "absent" }, /^- Heat flows hot to cold — held \(2026-10-21\)$/m],
+		] as const) {
+			const { chatId } = choiceThenRecallChat(`MC after production ${label} fixture`);
+			const ledgers = memoryLedgers();
+			ledgers.appendEvidence(productionAnswer(chatId, "call-recall", "2026-10-21T09:00:00.000Z", statuses));
+			ledgers.appendEvidence(choiceAnswer(chatId, "call-mc", "2026-10-23T09:00:00.000Z", true));
+			await extractWith(chatId, ledgers, [attributingStep(HEAT_PROPOSITIONS.slice(0, 1), CHOICE_THEN_RECALL)]);
+			assert.match(await listPropositions(ledgers, chatId), expected, label);
+		}
+	});
+
 	it("a wrong prediction, or \"I don't know\" on one, is neutral: recorded, never moves status", async () => {
 		for (const [label, over] of [
 			["wrong", {}],

@@ -168,6 +168,7 @@ describe("list_propositions", () => {
 		const tools = createProberTools({ ...baseCtx, chatStore, graphStore });
 		assert.match(tools.list_propositions!.description, /held .*misconception.*not held.*covered only.*encountered only/s);
 		assert.match(tools.list_sessions!.description, /covered is not held/);
+		assert.match(tools.list_propositions!.description, /not held \([^)]*wrong multiple-choice answer[^)]*\)/, "not held names a wrong multiple-choice answer too");
 	});
 
 	it("the prober doctrine says to probe anything not held — no longer that covered strands need no re-probing", () => {
