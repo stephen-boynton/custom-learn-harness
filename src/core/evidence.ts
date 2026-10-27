@@ -169,7 +169,13 @@ export function evidenceView(entries: ReadonlyArray<EvidenceEntry>): EvidenceVie
 			// One answer per question; a duplicate line never replaces the first.
 			if (!answers.has(entry.toolCallId)) answers.set(entry.toolCallId, { entry, seq });
 		} else {
-			const list = attributionsByCall.get(entry.toolCallId) ?? [];
+			// The NEWEST run wins (#11, owner 2026-10-27): a re-extraction
+			// attributes the question afresh, and its run REPLACES every
+			// earlier run's attributions of it — whole, not per key point
+			// (a key point the new run leaves out becomes unattached).
+			// Runs append in order, so a new run id starts a new list.
+			const previous = attributionsByCall.get(entry.toolCallId);
+			const list = previous?.[0]?.runId === entry.runId ? previous : [];
 			list.push(entry);
 			attributionsByCall.set(entry.toolCallId, list);
 		}

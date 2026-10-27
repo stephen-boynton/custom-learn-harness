@@ -2643,11 +2643,13 @@ describe("checks in the extraction view (ADR-0004, #8)", () => {
 		assert.match(view, /Which rule differentiates a composition\?/);
 		assert.match(view, /The product rule/);
 		assert.match(view, /^Correct answer: The chain rule$/m);
-		// Production: question and key points (ids as authored).
+		// Production: question and key points — ids as authored, prefixed by
+		// the check's alias so they can't pass for proposition ids (owner,
+		// after #9).
 		assert.match(view, /^CHECK q2 \[a2\]/m);
 		assert.match(view, /Why does the chain rule multiply rates\?/);
-		assert.match(view, /^ {2}p1: Each layer scales the change it receives$/m);
-		assert.match(view, /^ {2}p2: Scalings compose by multiplication$/m);
+		assert.match(view, /^ {2}q2\.p1: Each layer scales the change it receives$/m);
+		assert.match(view, /^ {2}q2\.p2: Scalings compose by multiplication$/m);
 		// The checks sit in reading order, after their message's prose.
 		assert.ok(view.indexOf("TEACHER [a1]") < view.indexOf("CHECK q1") && view.indexOf("CHECK q1") < view.indexOf("TEACHER [a2]"));
 
@@ -3081,7 +3083,162 @@ describe("held status from production evidence (#9)", () => {
 		assert.match(errors[0]!, /"q9" is not a check of THIS stretch/);
 		assert.match(errors[1]!, /no key point "k7"/);
 		assert.match(errors[2]!, /attribute it per key point/);
-		assert.match(errors[3]!, /"n_elsewhere" is not a proposition id of this submission/);
+		assert.match(errors[3]!, /"n_elsewhere" is neither a proposition id of this submission nor an existing idea id/);
+	});
+});
+
+// ─── checks on earlier-batch ideas; the newest run wins (#11) ──────────────
+//
+// Seam 2 again: the in-memory ledgers, scripted extractor/auditor, read
+// through list_propositions and the graph snapshot.
+
+/** The id the digest lists for a named idea (its THE GRAPH SO FAR line). */
+function digestIdOf(view: string, name: string): string | undefined {
+	return new RegExp(`^ {2}(n_\\S+) \\| ${name} \\|`, "m").exec(view)?.[1];
+}
+
+/** Append messages to a chat's saved record. */
+function appendMessages(chatId: string, messages: LhMessage[]): void {
+	chatStore.saveMessages(chatId, [...chatStore.getChat(chatId)!.messages, ...messages]);
+}
+
+describe("checks on earlier-batch ideas (#11)", () => {
+	it("a check on an idea the digest shows is attributed to that node by id and counts toward its status", async () => {
+		const { chatId } = checksChat("Earlier-batch fixture", [...assistant("a1", [{ type: "text", text: "Heat flows from hot to cold." }])]);
+		const ledgers = memoryLedgers();
+		await extractWith(chatId, ledgers, [attributingStep(HEAT_PROPOSITIONS.slice(0, 1), [])]);
+		const [born] = getGraph(ledgers).nodes;
+
+		// A later turn checks the earlier idea and teaches nothing new.
+		appendMessages(chatId, assistant("a2", [{ type: "text", text: "Let me check that idea." }, threePointCheck("call-heat")]));
+		ledgers.appendEvidence(productionAnswer(chatId, "call-heat", "2026-10-26T09:00:00.000Z", { k1: "present", k2: "absent", k3: "absent" }));
+		let seen: string | undefined;
+		await extractWith(chatId, ledgers, [
+			(...args) => {
+				seen = digestIdOf(capturedView(args[0]), "Heat flows hot to cold");
+				const step = attributingStep([], [{ check: "q1", keyPoint: "k1", propositions: [seen ?? "missing"] }]);
+				return (step as Extract<FauxResponseStep, (...a: never[]) => unknown>)(...args);
+			},
+		]);
+
+		assert.equal(seen, born!.id, "the digest offers the earlier idea's id");
+		assert.equal(getGraph(ledgers).nodes.length, 1, "no node is created");
+		assert.match(await listPropositions(ledgers, chatId), /^- Heat flows hot to cold — held \(2026-10-26\)$/m);
+	});
+
+	/** An idea born in ANOTHER session — never in this chat's digest. */
+	function ideaElsewhere(ledgers: ReturnType<typeof memoryLedgers>) {
+		const { chatId: elsewhere } = checksChat("Elsewhere fixture", [...assistant("e1", [{ type: "text", text: "Heat flows from hot to cold." }])]);
+		const node: GraphNode = {
+			id: `n_elsewhere_${elsewhere}`,
+			name: "Heat flows hot to cold",
+			statement: "Heat flows spontaneously from a hotter body to a colder one.",
+			aliases: [],
+			createdAt: "2026-10-01T00:00:00.000Z",
+			provenance: [{ chatId: elsewhere, messageId: "e1" }],
+		};
+		ledgers.appendNode(node);
+		return { elsewhere, node };
+	}
+
+	/** A chat whose one turn checks an idea it never teaches. */
+	function checkOnlyChat(title: string) {
+		return checksChat(title, [...assistant("a1", [{ type: "text", text: "A quick check before we go on." }, threePointCheck("call-heat")])]);
+	}
+
+	/** The extractor states the checked idea ONLY for attribution. */
+	const STATED_FOR_ATTRIBUTION = attributingStep(
+		[{ ...HEAT_PROPOSITIONS[0]!, forAttributionOnly: true } as (typeof HEAT_PROPOSITIONS)[number]],
+		[{ check: "q1", keyPoint: "k1", propositions: ["p1"] }],
+	);
+
+	/** An auditor step submitting the given links, capturing its prompt. */
+	function linkingAuditStep(links: Array<{ id: string; linkTo: string }>, capture?: (prompt: string) => void): FauxResponseStep {
+		return (context) => {
+			capture?.(capturedView(context));
+			return fauxAssistantMessage([fauxToolCall("submit_review", { links } as unknown as ToolCall["arguments"], { id: "review-call" })], {
+				stopReason: "toolUse",
+			});
+		};
+	}
+
+	it("a target stated only for attribution, linked by the auditor, attributes the check to the existing node — and adds nothing to the graph", async () => {
+		const ledgers = memoryLedgers();
+		const { elsewhere, node } = ideaElsewhere(ledgers);
+		const { chatId } = checkOnlyChat("Attribution-only link fixture");
+		ledgers.appendEvidence(productionAnswer(chatId, "call-heat", "2026-10-26T09:00:00.000Z", { k1: "present", k2: "absent", k3: "absent" }));
+		let auditorSaw = "";
+		await createExtractionPipeline({
+			chatStore,
+			graphStore: ledgers,
+			extractor: fauxEngine([STATED_FOR_ATTRIBUTION]),
+			auditor: fauxEngine([linkingAuditStep([{ id: "p1", linkTo: node.id }], (p) => (auditorSaw = p))]),
+		}).runExtraction(chatId);
+
+		assert.match(auditorSaw, /"forAttributionOnly": true/, "the auditor is told which target is stated only for attribution");
+		const graph = getGraph(ledgers);
+		assert.equal(graph.nodes.length, 1, "no node is created");
+		assert.deepEqual(graph.nodes[0]!.provenance.map((pt) => pt.chatId), [elsewhere], "a check teaches nothing: no provenance from this chat");
+		assert.deepEqual(graph.nodes[0]!.aliases, [], "and no phrasings join the node");
+		assert.match(await listPropositions(ledgers, elsewhere), /^- Heat flows hot to cold — held \(2026-10-26\)$/m);
+	});
+
+	it("a target stated only for attribution that the auditor cannot link is dropped: the check stays unattached and no node is created", async () => {
+		const ledgers = memoryLedgers();
+		const { elsewhere } = ideaElsewhere(ledgers);
+		const { chatId } = checkOnlyChat("Attribution-only drop fixture");
+		ledgers.appendEvidence(productionAnswer(chatId, "call-heat", "2026-10-26T09:00:00.000Z", { k1: "present", k2: "absent", k3: "absent" }));
+		await createExtractionPipeline({
+			chatStore,
+			graphStore: ledgers,
+			extractor: fauxEngine([STATED_FOR_ATTRIBUTION]),
+			auditor: fauxEngine([linkingAuditStep([])]),
+		}).runExtraction(chatId);
+
+		assert.equal(getGraph(ledgers).nodes.length, 1, "no node is created");
+		assert.deepEqual(evidenceView(ledgers.readEvidence()).unattached.map((a) => a.toolCallId), ["call-heat"]);
+		assert.match(await listPropositions(ledgers, elsewhere), /^- Heat flows hot to cold — covered only$/m);
+	});
+});
+
+describe("re-extraction: the newest run's attributions win (#11)", () => {
+	it("re-extracting a message replaces its checks' attributions, and the earlier entries stay in the ledger", async () => {
+		const { chatId } = checksChat("Re-attribution fixture", [
+			...assistant("a1", [{ type: "text", text: "Heat flows from hot to cold by collisions until equilibrium." }, threePointCheck("call-heat")]),
+		]);
+		const ledgers = memoryLedgers();
+		ledgers.appendEvidence(productionAnswer(chatId, "call-heat", "2026-10-20T09:00:00.000Z", { k1: "present", k2: "contradicted", k3: "absent" }));
+		await extractWith(chatId, ledgers, [
+			attributingStep(HEAT_PROPOSITIONS, [
+				{ check: "q1", keyPoint: "k1", propositions: ["p1"] },
+				{ check: "q1", keyPoint: "k2", propositions: ["p2"] },
+			]),
+		]);
+		const before = await listPropositions(ledgers, chatId);
+		assert.match(before, /^- Heat flows hot to cold — held \(2026-10-20\)$/m);
+		assert.match(before, /^- Collisions carry heat — misconception \(2026-10-20\)$/m);
+
+		// The teacher's prose changes → a1 re-opens; its check travels with
+		// it again and is attributed afresh: k2 now to the equilibrium idea
+		// (named by id from the digest), k1 to nothing.
+		const reopened = chatStore.getChat(chatId)!.messages.map((m) =>
+			m.id === "a1" && m.role === "assistant" ? ({ ...m, content: [{ type: "text", text: "Heat flows until temperatures are equal." }, ...m.content] } as LhMessage) : m,
+		);
+		chatStore.saveMessages(chatId, reopened);
+		await extractWith(chatId, ledgers, [
+			(...args) => {
+				const equilibrium = digestIdOf(capturedView(args[0]), "Thermal equilibrium") ?? "missing";
+				const step = attributingStep([], [{ check: "q1", keyPoint: "k2", propositions: [equilibrium] }]);
+				return (step as Extract<FauxResponseStep, (...a: never[]) => unknown>)(...args);
+			},
+		]);
+
+		const after = await listPropositions(ledgers, chatId);
+		assert.match(after, /^- Heat flows hot to cold — covered only$/m, "k1's old attribution no longer counts");
+		assert.match(after, /^- Collisions carry heat — covered only$/m, "k2's old target is replaced, not joined");
+		assert.match(after, /^- Thermal equilibrium — misconception \(2026-10-20\)$/m);
+		const attributions = ledgers.readEvidence().filter((e) => e.type === "attribution");
+		assert.equal(attributions.length, 3, "append-only: both runs' entries remain");
 	});
 });
 

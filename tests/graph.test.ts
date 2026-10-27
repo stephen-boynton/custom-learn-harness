@@ -667,7 +667,7 @@ describe("graph ledger store", () => {
 			thinking: "no idea",
 			at: "2026-10-27T00:00:00.000Z",
 		};
-		const attribution = { type: "attribution" as const, toolCallId: "call-store", keyPointId: "k1", propositionId: "n_x", at: "2026-10-27T00:01:00.000Z" };
+		const attribution = { type: "attribution" as const, toolCallId: "call-store", keyPointId: "k1", propositionId: "n_x", at: "2026-10-27T00:01:00.000Z", runId: "run_store" };
 		graphStore.appendEvidence(answer);
 		fs.appendFileSync(LEDGER_FILES.evidence, `{torn\n${JSON.stringify({ type: "answer", toolCallId: "bad" })}\n`, "utf-8");
 		graphStore.appendEvidence(attribution);

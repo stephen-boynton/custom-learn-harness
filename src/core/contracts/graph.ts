@@ -244,6 +244,14 @@ export interface ExtractedProposition {
 	 *  undefined → messageId "" (chat-level), so NO persisted shape or
 	 *  format version changes (GraphNode / ProvenancePoint untouched). */
 	messageId?: string;
+	/** SESSION PATH ONLY (#11, owner 2026-10-27): a TARGET STATED ONLY FOR
+	 *  ATTRIBUTION — an idea a check tests that this stretch does not
+	 *  teach and THE GRAPH SO FAR does not show. Never knowledge: the
+	 *  auditor links it to an existing node or it is dropped; the merger
+	 *  never creates, link-appends or chains it, and only attributions
+	 *  resolve through it. Its messageId is not an anchor (unchecked,
+	 *  unused). */
+	forAttributionOnly?: boolean;
 }
 
 /** One proposed argument (extractor redesign, 2026-09-30). Endpoints are
@@ -334,6 +342,10 @@ export interface AttributionEntry {
 	propositionId: string;
 	/** ISO — the merge that wrote it. */
 	at: string;
+	/** The merge that wrote it (#11, owner 2026-10-27): one id per merger
+	 *  write. Re-extraction attributes a check afresh; on read only the
+	 *  NEWEST run's attributions of a question count (core/evidence.ts). */
+	runId: string;
 }
 
 export type EvidenceEntry = AnswerEntry | AttributionEntry;
