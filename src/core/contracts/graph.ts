@@ -307,6 +307,10 @@ export interface AnswerEntry {
 	/** The grader's verdict, as stored on the answer. Absent on "I don't
 	 *  know" (never graded). */
 	verdict?: Verdict;
+	/** Recognition and prediction only: MC correctness, recomputed SERVER
+	 *  side from the call's committed correct answer (owner, 2026-10-27) —
+	 *  false on "I don't know". */
+	correct?: boolean;
 	/** The learner's stated confidence (0-100), when sent. */
 	confidence?: number;
 	/** false = the slider was never moved (the resting value was submitted

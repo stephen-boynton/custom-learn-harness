@@ -42,7 +42,7 @@ import { jobStore } from "../src/store/jobs.ts";
 import { buildAnswer, dismissedAnswer, normalizeOptions, questionDataFor, resolveCorrect, type QuestionData } from "../src/core/question-core.ts";
 import { danglingQuestionOf, endsInDismissal, needsContinuation, newAnswerResult, newUserMessage } from "../src/core/native-messages.ts";
 import { projectView } from "../src/core/view.ts";
-import { parseExplainInput } from "../src/core/tool-parts.ts";
+import { parseExplainInput, parseQuizInput } from "../src/core/tool-parts.ts";
 import type { PiEngine } from "../src/agent/models.ts";
 import type { LhMessage } from "../src/core/native-messages.ts";
 
@@ -2241,5 +2241,82 @@ describe("the independent grader puts a verdict on each production answer", () =
 		);
 		assert.equal(calls.length, 1, "the last answer fired the one turn");
 		assert.match(calls[0]!.join("\n"), /\\"label\\":\\"misconception\\"/, "the teacher's turn saw the verdict");
+	});
+});
+
+// ─── recognition and prediction answers as evidence (#10) ──────────────────
+describe("recognition and prediction answers become answer entries (#10)", () => {
+	/** Pose `quizInput` as call-1, answer it with `answerReq` (after
+	 *  `tamper` edits the client's record), return the chat and its entry. */
+	async function poseAndAnswerChoice(
+		quizInput: typeof QUIZ_INPUT,
+		answerReq: Parameters<typeof buildAnswer>[1],
+		tamper: (answer: ReturnType<typeof buildAnswer>) => void = () => {},
+	) {
+		const { engine } = scriptedTeacher(() => [
+			() => fauxAssistantMessage([fauxText("Quick check."), fauxToolCall("quiz", quizInput, { id: "call-1" })], { stopReason: "toolUse" }),
+			() => fauxAssistantMessage([fauxText("Noted.")]),
+		]);
+		const chat = createConfiguredChat("Test: recognition evidence");
+		createdChats.push(chat.id);
+		await drainTurn(post(chat.id, { type: "text", text: "teach me the planets" }), agentFactory(engine));
+		const pending = danglingQuestionOf(chatStore.getChat(chat.id)!.messages)!;
+		const qd = questionDataFor("quiz", pending.toolCallId, parseQuizInput(pending.input)!);
+		const answer = buildAnswer(qd, answerReq, "quiz");
+		tamper(answer);
+		await drainTurn(post(chat.id, { type: "answer", toolCallId: "call-1", answer }), agentFactory(engine));
+		const messages = chatStore.getChat(chat.id)!.messages;
+		const entry = evidenceLines.find((e): e is AnswerEntry => e.type === "answer" && e.chatId === chat.id);
+		return { chatId: chat.id, messages, entry };
+	}
+
+	it("a recognition answer entry carries correctness, kind, phase, confidence with the untouched flag, and thinking", async () => {
+		const { chatId, messages, entry } = await poseAndAnswerChoice(QUIZ_INPUT, {
+			values: ["Venus"],
+			confidence: 90,
+			confidenceTouched: true,
+			thinking: "LEARNER-THINKING-ON-CHOICE",
+		});
+		assert.ok(entry, "an answer entry was written");
+		const asking = messages.find((m) => m.role === "assistant" && m.content.some((b) => b.type === "toolCall" && b.id === "call-1"))!;
+		const result = messages.find((m) => m.role === "toolResult")!;
+		const { at, ...rest } = entry;
+		assert.ok(!Number.isNaN(Date.parse(at)), "timestamped");
+		assert.deepEqual(rest, {
+			type: "answer",
+			toolCallId: "call-1",
+			chatId,
+			questionMessageId: asking.id,
+			answerMessageId: result.id,
+			kind: "recognition",
+			phase: "probe", // no probe_done in this chat
+			dontKnow: false,
+			correct: false,
+			confidence: 90,
+			confidenceTouched: true,
+			thinking: "LEARNER-THINKING-ON-CHOICE",
+		});
+	});
+
+	it("correctness is recomputed on the server from the call's committed correct answer, never trusted from the client", async () => {
+		const lied = await poseAndAnswerChoice(QUIZ_INPUT, { values: ["Mars"], confidence: 50, confidenceTouched: false }, (a) => {
+			a.correct = true;
+		});
+		assert.equal(lied.entry?.correct, false, "a client claiming a wrong pick correct is overruled");
+		const right = await poseAndAnswerChoice(QUIZ_INPUT, { values: ["Mercury"], confidence: 50, confidenceTouched: false }, (a) => {
+			a.correct = false;
+		});
+		assert.equal(right.entry?.correct, true, "a right pick is correct whatever the client says");
+		assert.equal(right.entry?.confidenceTouched, false, "the untouched flag rides through");
+	});
+
+	it("a prediction answer entry is kind prediction; \"I don't know\" is recorded as not correct, with no confidence", async () => {
+		const { entry } = await poseAndAnswerChoice({ ...QUIZ_INPUT, type: "predict" }, { dontKnow: true });
+		assert.ok(entry, "an answer entry was written");
+		assert.equal(entry.kind, "prediction");
+		assert.equal(entry.dontKnow, true);
+		assert.equal(entry.correct, false);
+		assert.equal(entry.confidence, undefined);
+		assert.equal(entry.verdict, undefined, "multiple choice never goes through the grader");
 	});
 });
