@@ -4,19 +4,21 @@
  * prose — ordinary text blocks and explicit send_to_user messages. No
  * learner messages, thinking, other tool calls/results, or quiz blocks.
  * Everything else is INVISIBLE to coverage: it neither opens nor joins a run, so answering a quiz or editing a learner
- * message triggers nothing. "Covered" is by construction exactly "what
- * the extractor saw": the fingerprint (sha256 of a message's view lines)
- * and the extractor's prompt share ONE selection — the teacher prose.
+ * message triggers nothing. "Covered" means "the extractor saw the
+ * prose": the fingerprint (sha256 of a message's view lines) hashes the
+ * teacher prose alone. Since ADR-0004 the prompt is WIDER — posed checks
+ * travel with the prose as context outside coverage (core/check-view.ts)
+ * — but coverage keeps this one line builder for hashing.
  *
  * A per-chat append-only ledger records which messages have been
  * extracted by CONTENT FINGERPRINT; "uncovered" is DERIVED at read time
  * (fingerprint the current transcript, diff against the ledger) — never
  * dual-tracked. Runs are token-budgeted batches of the oldest uncovered
  * teacher-prose messages: greedy consecutive fill, a message is never
- * split, a single over-budget message rides alone. (The old
- * inseparability bond — call + results in one chunk — died with the
- * ruling: tool results are invisible now, so nothing needs keeping
- * together.)
+ * split, a single over-budget message rides alone; the checks travelling
+ * with a message weigh on the fill budget only. (The old call-and-result
+ * batching rule died with the 2026-09-28 ruling: tool results are
+ * invisible, so nothing needs keeping together.)
  */
 
 import { createHash } from "node:crypto";
@@ -155,8 +157,16 @@ export function coverageOf(
  * A single message larger than the budget becomes its own (over-budget)
  * run rather than being dropped. Runs are ephemeral — the durable record
  * is per-message coverage, checkpointed after each run merges.
+ * `extraTokens` is a slot's weight BEYOND its coverage tokens — the checks
+ * travelling with it (ADR-0004: check lines count toward the fill budget,
+ * never toward coverage tokens or the trigger).
  */
-export function batchRuns(slots: ReadonlyArray<CoverageSlot>, uncovered: ReadonlyArray<number>, budget: number): CoverageSlot[][] {
+export function batchRuns(
+	slots: ReadonlyArray<CoverageSlot>,
+	uncovered: ReadonlyArray<number>,
+	budget: number,
+	extraTokens: (slot: CoverageSlot) => number = () => 0,
+): CoverageSlot[][] {
 	if (budget <= 0 || uncovered.length === 0) return [];
 	const runs: CoverageSlot[][] = [];
 	let current: CoverageSlot[] = [];
@@ -168,9 +178,10 @@ export function batchRuns(slots: ReadonlyArray<CoverageSlot>, uncovered: Readonl
 	};
 	for (const i of uncovered) {
 		const slot = slots[i]!;
-		if (current.length > 0 && currentTokens + slot.tokens > budget) flush();
+		const weight = slot.tokens + extraTokens(slot);
+		if (current.length > 0 && currentTokens + weight > budget) flush();
 		current.push(slot);
-		currentTokens += slot.tokens;
+		currentTokens += weight;
 	}
 	flush();
 	return runs;
@@ -178,12 +189,10 @@ export function batchRuns(slots: ReadonlyArray<CoverageSlot>, uncovered: Readonl
 
 /**
  * A batch's deterministic tag: hash of its member fingerprints. This is the
- * observation-ref prefix for the run (obs:<tag>:<sourceId> in the merger):
- * re-running the SAME batch (crash recovery) produces the same refs and
- * dedupes; a re-opened (mutated) message changes the tag, so its fresh
- * understanding observations land as new events — the most-recent fold
- * sees the update. Run-local source ids ("p1"…) alone could never do this:
- * their positions shift between runs.
+ * identity of a run's prose: re-running the SAME batch produces the same
+ * tag; a re-opened (mutated) message changes it. Prose fingerprints only —
+ * the checks travelling with a batch never enter it. Run-local source ids
+ * ("p1"…) alone could never do this: their positions shift between runs.
  */
 export function batchTag(batch: ReadonlyArray<CoverageSlot>): string {
 	const h = createHash("sha256");

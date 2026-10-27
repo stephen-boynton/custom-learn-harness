@@ -52,6 +52,7 @@ import {
 	EXTRACTION_CORE,
 	SESSION_PREAMBLE,
 	SESSION_MESSAGE_ID_RULE,
+	SESSION_CHECKS_RULE,
 	NOTES_PREAMBLE,
 	EXTRACTOR_INSTRUCTIONS,
 	NOTES_EXTRACTOR_INSTRUCTIONS,
@@ -332,8 +333,11 @@ function silentModel(): PiEngine {
 
 // ─── transcriptView (pure) ───────────────────────────────────────────────────
 
-describe("transcriptView (pure — teacher prose only, owner 2026-09-28)", () => {
-	it("renders ONLY the teacher's prose — no learner, no checks, no tool notes", () => {
+describe("transcriptView (pure — teacher prose, plus posed checks since ADR-0004)", () => {
+	it("renders the teacher's prose — no learner, no results, no tool notes", () => {
+		// The fixture's quiz calls carry no options, so they were never
+		// posable checks (parseQuizInput refuses them) — the body is pure
+		// prose. Posed checks are pinned in "checks in the extraction view".
 		const { record } = fixtureChat();
 		const view = transcriptView(record);
 
@@ -1474,7 +1478,11 @@ describe("the extractor redesign (owner, 2026-09-30): chains are the deliverable
 
 		// The preambles differ in exactly their source description.
 		assert.notEqual(SESSION_PREAMBLE, NOTES_PREAMBLE);
-		assert.match(SESSION_PREAMBLE, /a teaching\s+session, rendered as the teacher's prose in reading order/);
+		assert.match(SESSION_PREAMBLE, /a teaching\s+session, rendered as the teacher's prose and the checks the teacher posed, in reading order/);
+		// CHECKS ARE CONTEXT ONLY (ADR-0004, #8): session-only, like the anchor rule.
+		assert.ok(EXTRACTOR_INSTRUCTIONS.includes(SESSION_CHECKS_RULE), "the session instructions carry the checks rule");
+		assert.match(SESSION_CHECKS_RULE, /CHECK/);
+		assert.ok(!NOTES_EXTRACTOR_INSTRUCTIONS.includes("CHECK"), "notes have no checks");
 		assert.match(NOTES_PREAMBLE, /the\s+author's personal notes, rendered in reading order/);
 
 		// NO RULE ARMOR (owner, 2026-09-30): the defensive lists are CUT
@@ -2522,3 +2530,225 @@ describe("notes import completion and retry reliability", () => {
 		assert.equal(ledgers.readNodes().length, 2);
 	});
 });
+
+// ── checks in the view (ADR-0004, #8): posed checks as context outside coverage ──
+
+/** A teacher multiple-choice check, posed and answered — the record holds
+ *  everything the learner did on the RESULT (which the view never reads). */
+function mcCheck(toolCallId: string, extra: Record<string, unknown> = {}): NativeCallDesc {
+	return {
+		name: "quiz",
+		toolCallId,
+		input: {
+			type: "check",
+			nodeId: "NODEID-SECRET",
+			question: "Which rule differentiates a composition?",
+			options: [
+				{ label: "The product rule", value: "product" },
+				{ label: "The chain rule", value: "chain" },
+			],
+			explanation: "EXPLANATION-SECRET",
+			correctAnswer: "chain",
+			...extra,
+		},
+		output: {
+			kind: "quiz", questionText: "Which rule differentiates a composition?", correct: false,
+			dontKnow: false, selected: ["1. The product rule"], confidence: 73, confidenceTouched: true,
+			thinking: "THINKING-SECRET", verdict: { label: "VERDICT-SECRET" }, answeredAt: "2026-10-27T01:00:00.000Z",
+		},
+	};
+}
+
+/** A teacher free-recall check with key points. */
+function explainCheck(toolCallId: string, type: "check" | "predict" = "check"): NativeCallDesc {
+	return {
+		name: "explain",
+		toolCallId,
+		input: {
+			type,
+			nodeId: "NODEID-SECRET",
+			question: "Why does the chain rule multiply rates?",
+			correctAnswer: "COMMITTED-SECRET: because each layer scales the change passed through it.",
+			keyPoints: [
+				{ id: "p1", text: "Each layer scales the change it receives", kind: "reason", required: true },
+				{ id: "p2", text: "Scalings compose by multiplication", kind: "fact", required: false },
+			],
+			details: "DETAILS-SECRET",
+		},
+		output: {
+			kind: "explain", questionText: "Why does the chain rule multiply rates?", answerText: "LEARNER-SECRET",
+			confidence: 41, confidenceTouched: true, thinking: "THINKING-SECRET", answeredAt: "2026-10-27T01:00:00.000Z",
+		},
+	};
+}
+
+function checksChat(title: string, messages: LhMessage[]) {
+	const chat = chatStore.createChat(title);
+	createdChats.push(chat.id);
+	chatStore.saveMessages(chat.id, messages);
+	return { chatId: chat.id, record: chatStore.getChat(chat.id)! };
+}
+
+async function extractViews(chatId: string, batches = 1, getChunkTokens?: () => number) {
+	const ledgers = memoryLedgers();
+	const views: string[] = [];
+	const pipeline = createExtractionPipeline({
+		chatStore,
+		graphStore: ledgers,
+		getChunkTokens,
+		extractor: fauxEngine(Array.from({ length: batches }, () => findingsStep((v) => views.push(v)))),
+		auditor: fauxEngine(Array.from({ length: batches }, () => passThroughAuditStep())),
+	});
+	await pipeline.runExtraction(chatId);
+	return { views, ledgers };
+}
+
+describe("checks in the extraction view (ADR-0004, #8)", () => {
+	it("shows each check as posed, labelled with its message id — never the learner's side, nodeId, explanation or details", async () => {
+		const { chatId } = checksChat("Checks view fixture", [
+			...assistant("a1", [
+				{ type: "text", text: "The chain rule multiplies the rates of the composed layers." },
+				mcCheck("call-mc"),
+			]),
+			user("u1", "ok"),
+			...assistant("a2", [{ type: "text", text: "Now explain it back." }, explainCheck("call-ex")]),
+		]);
+		const { views } = await extractViews(chatId);
+		assert.equal(views.length, 1);
+		const view = views[0]!;
+
+		// Recognition: question, options and the correct answer.
+		assert.match(view, /^CHECK q1 \[a1\]/m);
+		assert.match(view, /Which rule differentiates a composition\?/);
+		assert.match(view, /The product rule/);
+		assert.match(view, /^Correct answer: The chain rule$/m);
+		// Production: question and key points (ids as authored).
+		assert.match(view, /^CHECK q2 \[a2\]/m);
+		assert.match(view, /Why does the chain rule multiply rates\?/);
+		assert.match(view, /^ {2}p1: Each layer scales the change it receives$/m);
+		assert.match(view, /^ {2}p2: Scalings compose by multiplication$/m);
+		// The checks sit in reading order, after their message's prose.
+		assert.ok(view.indexOf("TEACHER [a1]") < view.indexOf("CHECK q1") && view.indexOf("CHECK q1") < view.indexOf("TEACHER [a2]"));
+
+		// Never the learner's side, and never what the ADR leaves out.
+		for (const secret of ["LEARNER-SECRET", "THINKING-SECRET", "VERDICT-SECRET", "NODEID-SECRET", "EXPLANATION-SECRET", "COMMITTED-SECRET", "DETAILS-SECRET", "73", "41", "call-mc", "call-ex"]) {
+			assert.ok(!view.includes(secret), `the view leaks ${secret}`);
+		}
+	});
+
+	it("a prediction shows its options and correct answer, marked as a prediction", async () => {
+		const { chatId } = checksChat("Prediction view fixture", [
+			...assistant("a1", [{ type: "text", text: "Before we start, a guess." }, mcCheck("call-pr", { type: "predict" })]),
+		]);
+		const [view] = (await extractViews(chatId)).views;
+		assert.match(view!, /^CHECK q1 \[a1\] — multiple choice, prediction$/m);
+		assert.match(view!, /^Correct answer: The chain rule$/m);
+	});
+
+	it("a check in a prose-less message waits for prose, then travels with the next prose batch", async () => {
+		const { chatId } = checksChat("Travelling check fixture", [
+			...assistant("a1", [{ type: "text", text: "Composed functions have layered rates." }]),
+			user("u1", "ok"),
+			...assistant("a2", [mcCheck("call-wait", { type: "predict" })]),
+		]);
+		const ledgers = memoryLedgers();
+		const views: string[] = [];
+		const make = () =>
+			createExtractionPipeline({
+				chatStore,
+				graphStore: ledgers,
+				extractor: fauxEngine([findingsStep((v) => views.push(v))]),
+				auditor: fauxEngine([passThroughAuditStep()]),
+			});
+
+		await make().runExtraction(chatId);
+		assert.equal(views.length, 1);
+		assert.doesNotMatch(views[0]!, /CHECK/, "no later prose yet — the check waits");
+
+		chatStore.saveMessages(chatId, [
+			...chatStore.getChat(chatId)!.messages,
+			...answerOf("call-wait"),
+			...assistant("a3", [{ type: "text", text: "The rates multiply." }]),
+		]);
+		await make().runExtraction(chatId);
+		assert.equal(views.length, 2);
+		assert.doesNotMatch(views[1]!, /TEACHER \[a1\]/, "a1 is covered");
+		assert.match(views[1]!, /^CHECK q1 \[a2\] — multiple choice, prediction$/m);
+		assert.ok(views[1]!.indexOf("CHECK q1 [a2]") < views[1]!.indexOf("TEACHER [a3]"), "reading order");
+		// It travelled with a3, which is now covered — it never travels again.
+		assert.equal(coverageOf(chatStore.getChat(chatId)!.messages, ledgers.readCoverage(), chatId).uncoveredCount, 0);
+	});
+
+	it("posed checks only: refused calls and ask_user_question never appear; dismissed and pending ones do", async () => {
+		const refused: LhMessage[] = assistant("a1", [{ type: "text", text: "Explain without key points." }, explainCheck("call-refused")]);
+		(refused[1] as { isError: boolean }).isError = true;
+		const { chatId } = checksChat("Posed-only fixture", [
+			...refused,
+			...assistant("a2", [
+				{ type: "text", text: "A quick ask, then a dismissed check." },
+				{ name: "ask_user_question", toolCallId: "call-ask", input: { question: "ASK-SECRET?" }, output: { kind: "ask" } },
+				{ ...mcCheck("call-dismissed"), output: { kind: "quiz", dismissed: true } },
+			]),
+			// Pending: posed, no result yet.
+			{
+				id: "a3",
+				role: "assistant",
+				content: [
+					{ type: "text", text: "One more." },
+					{ type: "toolCall", id: "call-pending", name: "explain", arguments: explainCheck("call-pending").input },
+				],
+				stopReason: "toolUse",
+				timestamp: Date.now(),
+			} as never,
+		]);
+		const [view] = (await extractViews(chatId)).views;
+		assert.equal((view!.match(/^CHECK /gm) ?? []).length, 2, "the dismissed and the pending check");
+		assert.match(view!, /^CHECK q1 \[a2\] — multiple choice$/m);
+		assert.match(view!, /^CHECK q2 \[a3\] — free recall$/m);
+		assert.doesNotMatch(view!, /ASK-SECRET/);
+	});
+
+	it("check lines count toward the fill budget, never toward coverage tokens", async () => {
+		const bigCheck = mcCheck("call-big", { question: `Which of these? ${"clause ".repeat(400)}` });
+		const prose = (n: number) => ({ type: "text", text: `topic ${n}: ${"detail ".repeat(700)}${n}` });
+		const plain = checksChat("Fill fixture (plain)", [1, 2, 3, 4, 5].flatMap((n) => assistant(`a${n}`, [prose(n)])));
+		const checked = checksChat(
+			"Fill fixture (checked)",
+			[1, 2, 3, 4, 5].flatMap((n) => assistant(`a${n}`, n === 2 ? [prose(n), bigCheck] : [prose(n)])),
+		);
+		// The trigger's measure is the prose's alone.
+		assert.equal(coverageOf(checked.record.messages, [], checked.chatId).uncoveredTokens, coverageOf(plain.record.messages, [], plain.chatId).uncoveredTokens);
+
+		// ~1230 tok per prose message at a 4096 budget: [a1,a2,a3] + [a4,a5]
+		// without the check; its ~800 tokens push a3 into the second batch.
+		const { views, ledgers } = await extractViews(checked.chatId, 2, () => 4096);
+		assert.equal(views.length, 2);
+		assert.match(views[0]!, /TEACHER \[a2\]/);
+		assert.match(views[0]!, /CHECK q1 \[a2\]/);
+		assert.doesNotMatch(views[0]!, /TEACHER \[a3\]/);
+		assert.match(views[1]!, /^TEACHER \[a3\]/m);
+
+		// Coverage rows: prose fingerprints and prose tokens only.
+		const slots = coverageSlots(checked.record.messages).filter((s) => s.tokens > 0);
+		assert.deepEqual(
+			ledgers.readCoverage().map((e) => [e.fp, e.tokens]).sort(),
+			slots.map((s) => [s.fp, s.tokens]).sort(),
+		);
+	});
+});
+
+/** The learner's answer to a posed check — the result the view never reads. */
+function answerOf(toolCallId: string): LhMessage[] {
+	return [
+		{
+			id: `r_${toolCallId}`,
+			role: "toolResult",
+			toolCallId,
+			toolName: "quiz",
+			content: [{ type: "text", text: "LEARNER-SECRET" }],
+			details: { kind: "quiz", correct: true, confidence: 90 },
+			isError: false,
+			timestamp: Date.now(),
+		} as never,
+	];
+}
