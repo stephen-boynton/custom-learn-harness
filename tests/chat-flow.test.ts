@@ -25,8 +25,9 @@ import {
 	fauxToolCall,
 	type FauxResponseStep,
 } from "@earendil-works/pi-ai";
+import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { createTeacherAgent } from "../src/agent/teacher-agent.ts";
-import { createTeacherTools } from "../src/agent/tools.ts";
+import { createTeacherTools, probeExplainTool, teachExplainToolFor } from "../src/agent/tools.ts";
 import { handleChatInput, handleChatRequest } from "../src/server/chat-handler.ts";
 import { effectiveSettings } from "../src/server/stores.ts";
 import { isTurnRunning } from "../src/server/turn-liveness.ts";
@@ -36,9 +37,10 @@ import { buildSubagentSteer } from "../src/core/contracts.ts";
 import { abortTurn, runningTurn, settledTurnResponse } from "../src/server/turn-runs.ts";
 import { chatStore } from "../src/store/chats.ts";
 import { jobStore } from "../src/store/jobs.ts";
-import { buildAnswer, dismissedAnswer, normalizeOptions, resolveCorrect, type QuestionData } from "../src/core/question-core.ts";
+import { buildAnswer, dismissedAnswer, normalizeOptions, questionDataFor, resolveCorrect, type QuestionData } from "../src/core/question-core.ts";
 import { danglingQuestionOf, endsInDismissal, needsContinuation, newAnswerResult, newUserMessage } from "../src/core/native-messages.ts";
 import { projectView } from "../src/core/view.ts";
+import { parseExplainInput } from "../src/core/tool-parts.ts";
 import type { PiEngine } from "../src/agent/models.ts";
 import type { LhMessage } from "../src/core/native-messages.ts";
 
@@ -1300,6 +1302,7 @@ it("explain tool call persists as a pending part; the free-text answer reveals t
 	const EXPLAIN_INPUT = {
 		question: "Explain why Mercury is hard to observe.",
 		correctAnswer: "Its small angular separation from the Sun — it never strays far from the Sun in our sky.",
+		keyPoints: KEY_POINTS,
 		nodeId: "planet-order",
 		type: "check", // the teach explain's role field (owner, 2026-10-09)
 	};
@@ -1740,5 +1743,105 @@ describe("duplicate provider tool-call ids (the Lacan fix)", () => {
 		assert.equal(askPart?.output?.kind, "ask", "the ask card keeps its own answer");
 		assert.equal(quizPart?.state, "output-available");
 		assert.equal(quizPart?.output?.kind, "quiz", "the quiz card got ITS answer (the pre-fix bug: it landed on the ask card)");
+	});
+});
+
+// ─── key points: the gradeable commitment (#6, ADR-0003) ───────────────────
+
+const KEY_POINTS = [
+	{ id: "p1", text: "Mercury's orbit keeps it close to the Sun in our sky.", kind: "fact", required: true },
+	{ id: "p2", text: "The Sun's glare hides anything that close to it.", kind: "reason", required: false },
+];
+
+describe("explain and recall commit key points — ungradeable commitments are refused and retried", () => {
+	const TEACH_EXPLAIN = {
+		type: "check",
+		nodeId: "planet-order",
+		question: "Explain why Mercury is hard to observe.",
+		correctAnswer: "It never strays far from the Sun in our sky, so the Sun's glare hides it.",
+		keyPoints: KEY_POINTS,
+	};
+	const PROBE_RECALL = {
+		question: "Explain why Mercury is hard to observe.",
+		correctAnswer: "It never strays far from the Sun in our sky, so the Sun's glare hides it.",
+		keyPoints: KEY_POINTS,
+	};
+	const point = (id: string, required = true) => ({ id, text: `Point ${id}.`, kind: "fact", required });
+	const badShapes: Array<[string, (input: Record<string, unknown>) => Record<string, unknown>, RegExp]> = [
+		["no keyPoints", ({ keyPoints: _drop, ...rest }) => rest, /keyPoints/],
+		["an empty keyPoints list", (input) => ({ ...input, keyPoints: [] }), /keyPoints/],
+		["more than 4 key points", (input) => ({ ...input, keyPoints: ["p1", "p2", "p3", "p4", "p5"].map((id) => point(id)) }), /keyPoints/],
+		["duplicate key point ids", (input) => ({ ...input, keyPoints: [point("p1"), point("p1")] }), /duplicate key point id \\"p1\\"/],
+		["no required key point", (input) => ({ ...input, keyPoints: [point("p1", false), point("p2", false)] }), /required/],
+	];
+
+	for (const [toolName, good] of [
+		["explain", TEACH_EXPLAIN],
+		["recall", PROBE_RECALL],
+	] as const) {
+		for (const [shape, mutate, problem] of badShapes) {
+			it(`${toolName} with ${shape} is refused at the call boundary and the model retries`, async () => {
+				const bad = mutate(good);
+				const steps = (cs: string[][]): FauxResponseStep[] => [
+					(context) => {
+						cs.push(context.messages.map((m) => JSON.stringify((m as { content: unknown }).content)));
+						return fauxAssistantMessage([fauxToolCall(toolName, bad as never, { id: "call-bad" })], { stopReason: "toolUse" });
+					},
+					(context) => {
+						cs.push(context.messages.map((m) => JSON.stringify((m as { content: unknown }).content)));
+						return fauxAssistantMessage([fauxToolCall(toolName, good, { id: "call-good" })], { stopReason: "toolUse" });
+					},
+				];
+				const { engine, calls } = scriptedTeacher(steps);
+				const chat = createConfiguredChat(`Test: ${toolName} ${shape}`);
+				createdChats.push(chat.id);
+				const tools: Record<string, AgentTool<any>> =
+					toolName === "explain"
+						? { explain: teachExplainToolFor({ chatId: chat.id, chatStore }) }
+						: { recall: probeExplainTool };
+				const factory: Parameters<typeof handleChatRequest>[1] = (opts) =>
+					createTeacherAgent(undefined, { engine, messages: opts.messages, tools });
+				const body = await drainTurn(post(chat.id, { type: "text", text: "quiz me" }), factory);
+
+				const events = eventsOf(body);
+				const badEnd = events.find((e) => e.type === "tool_execution_end" && e.toolCallId === "call-bad");
+				assert.equal(badEnd?.isError, true, "the ungradeable call surfaced as an error execution");
+				const goodEnd = events.find((e) => e.type === "tool_execution_end" && e.toolCallId === "call-good");
+				assert.equal(goodEnd?.isError, false, "the retry is clean — the dock mounts on it");
+				assert.equal(calls.length, 2, "the refusal re-prompted the model");
+				assert.match(calls[1]!.join(" "), problem, "the problem reached the model");
+				const pending = danglingQuestionOf(chatStore.getChat(chat.id)!.messages);
+				assert.equal(pending?.toolCallId, "call-good", "the retried question is the pending one");
+			});
+		}
+	}
+
+	it("a valid explain is posed, and its key points are stored with the commitment on the answer record", async () => {
+		const { engine } = scriptedTeacher(() => [
+			() => fauxAssistantMessage([fauxToolCall("explain", TEACH_EXPLAIN, { id: "call-kp" })], { stopReason: "toolUse" }),
+			() => fauxAssistantMessage([fauxText("Good.")]),
+		]);
+		const chat = createConfiguredChat("Test: explain key points stored");
+		createdChats.push(chat.id);
+		const tools = { explain: teachExplainToolFor({ chatId: chat.id, chatStore }) };
+		const factory: Parameters<typeof handleChatRequest>[1] = (opts) =>
+			createTeacherAgent(undefined, { engine, messages: opts.messages, tools });
+		await drainTurn(post(chat.id, { type: "text", text: "teach me" }), factory);
+
+		const pending = danglingQuestionOf(chatStore.getChat(chat.id)!.messages);
+		assert.equal(pending?.toolCallId, "call-kp", "the explain was posed");
+
+		// The dock's own path: the question data built from the posed call,
+		// then the learner's answer.
+		const qd = questionDataFor("explain", pending!.toolCallId, parseExplainInput(pending!.input)!);
+		const answer = buildAnswer(qd, { text: "It is always near the Sun." }, "explain");
+		await drainTurn(post(chat.id, { type: "answer", toolCallId: "call-kp", answer }), factory);
+
+		const saved = chatStore.getChat(chat.id)!;
+		const result = saved.messages.find((m) => (m as { role?: string }).role === "toolResult") as {
+			details?: { committed?: string; keyPoints?: unknown };
+		};
+		assert.equal(result.details?.committed, TEACH_EXPLAIN.correctAnswer);
+		assert.deepEqual(result.details?.keyPoints, KEY_POINTS, "the key points ride the answer record beside the commitment");
 	});
 });
