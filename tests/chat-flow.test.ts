@@ -29,9 +29,10 @@ import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { bareQuestionTools, createTeacherAgent } from "../src/agent/teacher-agent.ts";
 import { createTeacherTools, probeExplainTool, teachExplainToolFor } from "../src/agent/tools.ts";
 import { graderModelOverride, graderTimeoutMs } from "../src/agent/subagents/grader.ts";
-import { handleChatInput, handleChatRequest } from "../src/server/chat-handler.ts";
+import { extraction, handleChatInput, handleChatRequest } from "../src/server/chat-handler.ts";
+import { coverageOf } from "../src/core/coverage.ts";
 import { effectiveSettings, stores } from "../src/server/stores.ts";
-import type { AnswerEntry, EvidenceEntry } from "../src/core/contracts.ts";
+import type { AnswerEntry, CoverageEntry, EvidenceEntry } from "../src/core/contracts.ts";
 import { isTurnRunning } from "../src/server/turn-liveness.ts";
 import { deliverJobResult, registerLiveAgent, setTurnRunner, steerLiveChat, unregisterLiveAgent } from "../src/server/jobs.ts";
 import { SessionModel } from "../components/session-core.ts";
@@ -2277,6 +2278,55 @@ describe("the independent grader puts a verdict on each production answer", () =
 		);
 		assert.equal(calls.length, 1, "the last answer fired the one turn");
 		assert.match(calls[0]!.join("\n"), /\\"label\\":\\"misconception\\"/, "the teacher's turn saw the verdict");
+	});
+
+	it("answering a check never starts an extraction run — only teacher prose does", async () => {
+		// The trigger is live for this test (it is skipped under NODE_ENV=test),
+		// the pipeline is a spy, and coverage lives in memory.
+		const coverage: CoverageEntry[] = [];
+		const graphStore = stores.graphStore;
+		stores.graphStore = { ...graphStore, readCoverage: () => [...coverage], appendCoverage: (e) => void coverage.push(e) };
+		const runs: string[] = [];
+		const realRun = extraction.runExtraction;
+		extraction.runExtraction = async (id: string) => {
+			runs.push(id);
+			return undefined as never;
+		};
+		const LONG = (word: string) => Array.from({ length: 5000 }, () => word).join(" "); // ≫ the 4096-token budget
+		const { engine } = scriptedTeacher(() => [
+			() => fauxAssistantMessage([fauxText("Short prose."), fauxToolCall("explain", GRADED_EXPLAIN, { id: "call-g" })], { stopReason: "toolUse" }),
+			() => fauxAssistantMessage([fauxText("OK.")]),
+			() => fauxAssistantMessage([fauxText(LONG("prose"))]),
+		]);
+		const chat = createConfiguredChat("Test: answers never trigger extraction");
+		createdChats.push(chat.id);
+		const tools = { explain: teachExplainToolFor({ chatId: chat.id, chatStore }) };
+		const factory: Parameters<typeof handleChatRequest>[1] = (opts) => createTeacherAgent(undefined, { engine, messages: opts.messages, tools });
+		const env = process.env.NODE_ENV;
+		try {
+			await drainTurn(post(chat.id, { type: "text", text: "teach me" }), factory);
+			// Everything so far is covered: only what the answer turn adds counts.
+			const foldedAt = new Date().toISOString();
+			for (const slot of coverageOf(chatStore.getChat(chat.id)!.messages, [], chat.id).slots) {
+				if (slot.tokens > 0) coverage.push({ chatId: chat.id, fp: slot.fp, tokens: slot.tokens, foldedAt });
+			}
+			(process.env as Record<string, string>).NODE_ENV = "development";
+			graderModelOverride.current = scriptedGrader([verdictCall(["present", "absent", "absent"])]).engine;
+			const pending = danglingQuestionOf(chatStore.getChat(chat.id)!.messages)!;
+			const qd = questionDataFor("explain", pending.toolCallId, parseExplainInput(pending.input)!);
+			const answer = buildAnswer(qd, { text: LONG("answer"), thinking: LONG("thinking"), confidence: 70, confidenceTouched: true }, "explain");
+			await drainTurn(post(chat.id, { type: "answer", toolCallId: "call-g", answer }), factory);
+			assert.deepEqual(runs, [], "a long answer, its thinking and a short reaction open no run");
+
+			// The control: long teacher prose does reach the trigger.
+			await drainTurn(post(chat.id, { type: "text", text: "go on" }), factory);
+			assert.deepEqual(runs, [chat.id], "teacher prose over the budget starts a run");
+		} finally {
+			(process.env as Record<string, string | undefined>).NODE_ENV = env;
+			graderModelOverride.current = undefined;
+			extraction.runExtraction = realRun;
+			stores.graphStore = graphStore;
+		}
 	});
 
 	it("a duplicate submit of a deferred sibling answer, arriving while it is graded, never calls the grader twice", async () => {
