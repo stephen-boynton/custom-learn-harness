@@ -30,7 +30,8 @@ import { bareQuestionTools, createTeacherAgent } from "../src/agent/teacher-agen
 import { createTeacherTools, probeExplainTool, teachExplainToolFor } from "../src/agent/tools.ts";
 import { graderModelOverride, graderTimeoutMs } from "../src/agent/subagents/grader.ts";
 import { handleChatInput, handleChatRequest } from "../src/server/chat-handler.ts";
-import { effectiveSettings } from "../src/server/stores.ts";
+import { effectiveSettings, stores } from "../src/server/stores.ts";
+import type { AnswerEntry, EvidenceEntry } from "../src/core/contracts.ts";
 import { isTurnRunning } from "../src/server/turn-liveness.ts";
 import { deliverJobResult, registerLiveAgent, setTurnRunner, steerLiveChat, unregisterLiveAgent } from "../src/server/jobs.ts";
 import { SessionModel } from "../components/session-core.ts";
@@ -58,6 +59,19 @@ import { PATHS } from "../config.ts";
 // turns pin openrouter per chat — the gate reads env-first truth, so the
 // key must be present in the test process like any real setup.
 process.env.OPENROUTER_API_KEY ??= "test-key-presence-gate";
+
+// The evidence ledger (#9, owner 2026-10-27): the handler's graph store is
+// overridden so answer entries land in memory — no test writes data/graph.
+const evidenceLines: EvidenceEntry[] = [];
+const realGraphStore = stores.graphStore;
+stores.graphStore = {
+	...realGraphStore,
+	appendEvidence: (entry) => void evidenceLines.push(structuredClone(entry)),
+	readEvidence: () => evidenceLines.map((entry) => structuredClone(entry)),
+};
+after(() => {
+	stores.graphStore = realGraphStore;
+});
 
 const QUIZ_INPUT = {
 	question: "Which planet is closest to the sun?",
@@ -1985,6 +1999,47 @@ describe("the independent grader puts a verdict on each production answer", () =
 		assert.equal(stored.verdict, undefined, "no verdict on a don't-know answer");
 		assert.equal(teacherCalls, 2, "the teacher's turn ran");
 		assert.deepEqual(teacherSaw.verdict, { label: "dont_know" });
+	});
+
+	/** The evidence ledger's answer entry for a chat's question. */
+	const answerEntryOf = (chatId: string): AnswerEntry | undefined =>
+		evidenceLines.find((e): e is AnswerEntry => e.type === "answer" && e.chatId === chatId);
+
+	it("the graded answer becomes an answer entry: verdict, confidence with the untouched flag, thinking, anchors, kind and phase", async () => {
+		const grader = scriptedGrader([verdictCall(["present", "absent", "contradicted"])]);
+		const { stored, chatId } = await poseAndAnswer(
+			{ text: LEARNER_TEXT, confidence: 50, confidenceTouched: false, thinking: "LEARNER-THINKING-ON-QUESTION" },
+			grader.engine,
+		);
+		const entry = answerEntryOf(chatId);
+		assert.ok(entry, "an answer entry was written");
+		const messages = chatStore.getChat(chatId)!.messages;
+		const asking = messages.find((m) => m.role === "assistant" && m.content.some((b) => b.type === "toolCall" && b.id === "call-g"))!;
+		const result = messages.find((m) => m.role === "toolResult")!;
+		const { at, ...rest } = entry;
+		assert.ok(!Number.isNaN(Date.parse(at)), "timestamped");
+		assert.deepEqual(rest, {
+			type: "answer",
+			toolCallId: "call-g",
+			chatId,
+			questionMessageId: asking.id,
+			answerMessageId: result.id,
+			kind: "production",
+			phase: "probe", // no probe_done in this chat
+			dontKnow: false,
+			verdict: stored.verdict,
+			confidence: 50,
+			confidenceTouched: false,
+			thinking: "LEARNER-THINKING-ON-QUESTION",
+		});
+	});
+
+	it("'I don't know' is an answer entry too, with no verdict", async () => {
+		const { chatId } = await poseAndAnswer({ dontKnow: true }, scriptedGrader([]).engine);
+		const entry = answerEntryOf(chatId)!;
+		assert.equal(entry.dontKnow, true);
+		assert.equal(entry.verdict, undefined);
+		assert.equal(entry.kind, "production");
 	});
 
 	describe("grading failures record an uncertain verdict and the turn proceeds", () => {

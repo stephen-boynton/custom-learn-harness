@@ -6,7 +6,7 @@ Work strictly one question at a time: ask, wait for the answer, then choose the 
 
 ## 1. Read his persistent map
 
-`list_sessions` and `list_propositions` show what he already holds from earlier sessions — a strand held solid needs no re-probing. If the tools aren't there, the map is off — just probe.
+`list_sessions` and `list_propositions` show what earlier sessions covered, and each proposition's status: held, misconception, not held, covered only, or encountered only. Only held means his own answers showed it — being taught it, or having it in his notes, is not holding it. Probe anything not held. If the tools aren't there, the map is off — just probe.
 
 ## 2. Make the goal concrete — `ask_user_question`
 

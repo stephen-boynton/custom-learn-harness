@@ -19,6 +19,7 @@
 // ─── Knowledge graph (vision §1 — global, cross-session) ────────────────────
 
 import type { CallUsage, ExtractionRunUsage } from "./chat.ts";
+import type { Verdict } from "../verdict.ts";
 
 /** One relation of the DERIVED view — chains are the stored truth (owner,
  *  2026-09-30: "the graph is a lossy image of what is truly stored"), and
@@ -255,11 +256,83 @@ export interface ExtractedChain {
 	conclusion: string;
 }
 
-/** The extractor's output shape: the raw reasoning chains. */
+/** One attribution the extractor made (spec #2, #9): a check — or one
+ *  key point of a production check — and the propositions it tested,
+ *  judged from the question alone. The pipeline has already resolved the
+ *  view's batch-local alias ("q1") to the call's toolCallId; the
+ *  propositions are extractor-local ids of the SAME submission ("p1", …),
+ *  resolved to node ids by the merger. */
+export interface ExtractedAttribution {
+	toolCallId: string;
+	/** The key point id as the teacher authored it (production checks);
+	 *  absent for a recognition question or prediction (the whole check). */
+	keyPointId?: string;
+	propositions: string[];
+}
+
+/** The extractor's output shape: the raw reasoning chains, plus (session
+ *  door only, #9) the checks' attributions. */
 export interface SessionFindings {
 	propositions: ExtractedProposition[];
 	chains: ExtractedChain[];
+	/** Session door only; absent on notes findings (no checks there). */
+	attributions?: ExtractedAttribution[];
 }
+
+// ─── The evidence ledger (spec #2, ADR-0002 — evidence.jsonl) ───────────────
+//
+// Append-only, NEVER rewritten (not part of rewriteLedgers). Two kinds of
+// entry, both keyed by the question's toolCallId; held is DERIVED on read
+// by joining them (core/evidence.ts), so an answer may land before or
+// after its question is extracted.
+
+/** What an answer is evidence OF (glossary): only production answers can
+ *  make a proposition held. */
+export type EvidenceKind = "production" | "recognition" | "prediction";
+
+/** Written when an answer is graded (production; an explain-predict is a
+ *  graded `prediction`) — by the chat handler, once, after the answer is
+ *  saved. */
+export interface AnswerEntry {
+	type: "answer";
+	toolCallId: string;
+	chatId: string;
+	/** The assistant message whose tool call posed the question. */
+	questionMessageId: string;
+	/** The toolResult message that carries the answer. */
+	answerMessageId: string;
+	kind: EvidenceKind;
+	phase: "probe" | "teach";
+	dontKnow: boolean;
+	/** The grader's verdict, as stored on the answer. Absent on "I don't
+	 *  know" (never graded). */
+	verdict?: Verdict;
+	/** The learner's stated confidence (0-100), when sent. */
+	confidence?: number;
+	/** false = the slider was never moved (the resting value was submitted
+	 *  untouched) — mirrors QuestionAnswerData.confidenceTouched. */
+	confidenceTouched?: boolean;
+	/** The learner's thinking on the question, when any. */
+	thinking?: string;
+	/** ISO — when the entry was written. "Most recent evidence" orders by
+	 *  this (owner, 2026-10-27). */
+	at: string;
+}
+
+/** Written by the deterministic merger: one line per (check, key point,
+ *  proposition) the extractor attributed. */
+export interface AttributionEntry {
+	type: "attribution";
+	toolCallId: string;
+	/** Absent for a recognition question or prediction (the whole check). */
+	keyPointId?: string;
+	/** The graph node id the attribution resolved to. */
+	propositionId: string;
+	/** ISO — the merge that wrote it. */
+	at: string;
+}
+
+export type EvidenceEntry = AnswerEntry | AttributionEntry;
 
 /** One identity verdict: the extractor's local proposition id → the
  *  EXISTING graph node that proposition IS. On link, the session's

@@ -13,6 +13,9 @@
  *                                      another line; readers merge)
  *   sessions.jsonl  SessionCheckpoint— emission checkpoints (foldedAt)
  *   coverage.jsonl  CoverageEntry    — per-message extraction coverage
+ *   evidence.jsonl  EvidenceEntry    — the evidence ledger (spec #2): answer
+ *                                      and attribution entries, NEVER
+ *                                      rewritten (no rewriteLedgers key)
  *
  * CHAINS-PRIMARY (owner, 2026-09-30): there is NO edges ledger — the edge
  * view (implication nodes + untyped arrows) is derived in core/graph.ts on
@@ -44,6 +47,7 @@ import type {
 	Position,
 	ProvenancePoint,
 	CoverageEntry,
+	EvidenceEntry,
 	SessionCheckpoint,
 } from "../core/contracts.ts";
 import type { GraphStore } from "../core/ports.ts";
@@ -126,6 +130,31 @@ const isCheckpoint = (v: unknown): v is SessionCheckpoint =>
 const isCoverageEntry = (v: unknown): v is CoverageEntry =>
 	isRecord(v) && isString(v.chatId) && isString(v.fp) && typeof v.tokens === "number" && isString(v.foldedAt);
 
+const EVIDENCE_KINDS = new Set(["production", "recognition", "prediction"]);
+const EVIDENCE_PHASES = new Set(["probe", "teach"]);
+
+/** An evidence line (spec #2): an answer or an attribution, keyed by the
+ *  question's toolCallId. The verdict's inner shape is the grader's,
+ *  validated before it was ever saved — the guard checks it is an object. */
+const isEvidenceEntry = (v: unknown): v is EvidenceEntry => {
+	if (!isRecord(v) || !isString(v.toolCallId) || !isString(v.at)) return false;
+	if (v.type === "attribution") {
+		return isString(v.propositionId) && (v.keyPointId === undefined || isString(v.keyPointId));
+	}
+	return (
+		v.type === "answer" &&
+		isString(v.chatId) &&
+		isString(v.questionMessageId) &&
+		isString(v.answerMessageId) &&
+		isString(v.kind) &&
+		EVIDENCE_KINDS.has(v.kind) &&
+		isString(v.phase) &&
+		EVIDENCE_PHASES.has(v.phase) &&
+		typeof v.dontKnow === "boolean" &&
+		(v.verdict === undefined || isRecord(v.verdict))
+	);
+};
+
 // ─── the port implementation ────────────────────────────────────────────────
 
 export const graphStore: GraphStore = {
@@ -160,6 +189,15 @@ export const graphStore: GraphStore = {
 	},
 	readCoverage(): CoverageEntry[] {
 		return readValid(LEDGER_FILES.coverage, isCoverageEntry);
+	},
+
+	/** The evidence ledger — append-only, never rewritten (no
+	 *  rewriteLedgers key). */
+	appendEvidence(entry: EvidenceEntry): void {
+		appendLine(LEDGER_FILES.evidence, entry);
+	},
+	readEvidence(): EvidenceEntry[] {
+		return readValid(LEDGER_FILES.evidence, isEvidenceEntry);
 	},
 
 	// ── imported-notes bookkeeping (config.SOURCES_FILE — a JSON map) ──

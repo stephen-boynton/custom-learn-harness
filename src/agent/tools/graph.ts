@@ -1,7 +1,8 @@
 import { Type } from "typebox";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { serverExecute } from "../tool-execute.ts";
-import { getGraph, graphSessionIndex, graphSessionPropositions } from "../../core/graph.ts";
+import { getGraph, graphSessionIndex, graphSessionPropositions, graphSessionStatuses } from "../../core/graph.ts";
+import type { HeldStatus } from "../../core/evidence.ts";
 import type { ChatStore, GraphStore } from "../../core/ports.ts";
 
 /**
@@ -10,9 +11,11 @@ import type { ChatStore, GraphStore } from "../../core/ports.ts";
  * reads the learner's persistent knowledge map through two tools instead,
  * replacing the old injected block with on-demand eyes.
  *
- * Names + levels + dating ONLY — no statement text, no session contents
- * (owner ruling: the map's ORGANIZATION is the prober's business, its
- * prose is not). The data comes from Platform's pure core seams
+ * Names + held status + dating ONLY — no statement text, no answer text,
+ * no session contents (owner ruling: the map's ORGANIZATION is the
+ * prober's business, its prose is not). The status (spec #2, #9) is
+ * derived from the evidence ledger on read (core/evidence.ts): covered is
+ * never presented as held. The data comes from Platform's pure core seams
  * (graphSessionIndex / graphSessionPropositions) over the same ports the
  * snapshot reads, so the prober and the learner's graph view can never
  * disagree.
@@ -38,6 +41,15 @@ const listPropositionsInput = Type.Object({
 	}),
 });
 
+/** The status words the prober reads (owner, 2026-10-27 — exactly these). */
+const STATUS_WORDS: Record<HeldStatus, string> = {
+	held: "held",
+	misconception: "misconception",
+	not_held: "not held",
+	covered_only: "covered only",
+	encountered_only: "encountered only",
+};
+
 export function proberGraphTools(ctx: GraphToolContext): Record<string, AgentTool<any>> {
 	const deps = { chatStore: ctx.chatStore, graphStore: ctx.graphStore };
 	return {
@@ -47,7 +59,7 @@ export function proberGraphTools(ctx: GraphToolContext): Record<string, AgentToo
 			description:
 				"List the sessions of the learner's persistent knowledge graph — every chat or imported-notes file that ever contributed a proposition, most recent first. The map is organized into birth-session clusters (propositions grouped by the session they were first learned in), and session names are those clusters' labels. " +
 				"Each line: the session's name, kind (chat/file), how many propositions were born in it, its dates, and its id — use that id with list_propositions. " +
-				"Reading this first shows what he has already covered and when, before you probe anything.",
+				"Reading this first shows what earlier sessions covered and when, before you probe anything — covered is not held: list_propositions shows which of it he holds.",
 			parameters: listSessionsInput,
 			execute: serverExecute("list_sessions", listSessionsInput, async (): Promise<string> => {
 				const sessions = graphSessionIndex(deps);
@@ -63,16 +75,21 @@ export function proberGraphTools(ctx: GraphToolContext): Record<string, AgentToo
 			name: "list_propositions",
 			label: "list_propositions",
 			description:
-				"List the propositions BORN in one knowledge-graph session — what was covered there. " +
-				"Names only — no statement text, no session contents (owner ruling 2026-09-23: the map's ORGANIZATION is your business, its prose is not).",
+				"List the propositions BORN in one knowledge-graph session, each with his status and the day of its latest evidence: " +
+				"held (his latest free-recall answer showed it), misconception (that answer contradicted it), " +
+				"not held (he missed it or said he didn't know), covered only (taught, never shown) or encountered only (from his notes, never shown). " +
+				"Only held means he has shown it. " +
+				"Names only — no statement text, no answer text (owner ruling 2026-09-23: the map's ORGANIZATION is your business, its prose is not).",
 			parameters: listPropositionsInput,
 			execute: serverExecute("list_propositions", listPropositionsInput, async ({ session }): Promise<string> => {
-				const propositions = graphSessionPropositions(deps, session);
+				const propositions = graphSessionStatuses(deps, session);
 				if (propositions.length === 0) {
 					return `No propositions born in session "${session}". Call list_sessions for the current ids.`;
 				}
-				const lines = propositions.map((p) => `- ${p.name}`);
-				return `${propositions.length} proposition(s) covered in this session:\n${lines.join("\n")}`;
+				const lines = propositions.map(
+					(p) => `- ${p.name} — ${STATUS_WORDS[p.status]}${p.latestAt ? ` (${p.latestAt.slice(0, 10)})` : ""}`,
+				);
+				return `${propositions.length} proposition(s) born in this session:\n${lines.join("\n")}`;
 			}),
 		},
 	};

@@ -32,11 +32,12 @@ import { newPlanBlockMessage } from "../src/core/native-messages.ts";
 import { projectView as projectNative } from "../src/core/view.ts";
 import type {
 	AuditVerdicts,
+	AnswerEntry,
 	CoverageEntry,
+	EvidenceEntry,
 	ExtractionRunUsage,
 	GraphChain,
 	GraphNode,
-
 	NotesSource,
 	SessionCheckpoint,
 	SessionFindings,
@@ -58,6 +59,8 @@ import {
 	NOTES_EXTRACTOR_INSTRUCTIONS,
 } from "../src/agent/subagents/extraction.ts";
 import { getGraph, simplifyChains } from "../src/core/graph.ts";
+import { proberGraphTools } from "../src/agent/tools/graph.ts";
+import { evidenceView } from "../src/core/evidence.ts";
 import { ModelsNotConfiguredError, ProviderKeyMissingError, providerKeyMissing, type ModelSlotName } from "../src/core/settings.ts";
 import { coverageOf, coverageSlots, messageViewLines } from "../src/core/coverage.ts";
 import { chatStore } from "../src/store/chats.ts";
@@ -84,6 +87,7 @@ function memoryLedgers() {
 	const chains: GraphChain[] = [];
 	const checkpoints: SessionCheckpoint[] = [];
 	const coverage: CoverageEntry[] = [];
+	const evidence: EvidenceEntry[] = [];
 	const sources = new Map<string, NotesSource>();
 	const positions = new Map<string, { x: number; y: number }>();
 		return {
@@ -97,6 +101,9 @@ function memoryLedgers() {
 		// the chat pipeline checkpoints one entry per covered message.
 		appendCoverage: (e) => void coverage.push({ ...e }),
 		readCoverage: () => coverage.map((e) => ({ ...e })),
+		// The evidence ledger (spec #2) — append-only, never rewritten.
+		appendEvidence: (e) => void evidence.push(structuredClone(e)),
+		readEvidence: () => evidence.map((e) => structuredClone(e)),
 		upsertSource: (s: NotesSource) => {
 			// Mirrors the real store: an upsert KEEPS the existing usage log.
 			const prev = sources.get(s.id);
@@ -262,6 +269,9 @@ const FINDINGS = {
 			conclusion: "p2",
 		},
 	],
+	// The session wire's attributions (#9) — the fixture's checks are not
+	// posable (no options), so there is nothing to attribute.
+	attributions: [],
 };
 
 /** An engine whose ONE response is the `name` tool call with the given
@@ -438,6 +448,7 @@ describe("the extraction pipeline (extractor → auditor → merger)", () => {
 		const extractor = submitModel("submit_findings", {
 			propositions: JSON.stringify(FINDINGS.propositions),
 			chains: FINDINGS.chains,
+			attributions: [],
 		});
 
 		const pipeline = createExtractionPipeline({ chatStore, graphStore: ledgers, extractor, auditor: submitModel("submit_review", verdict) });
@@ -451,6 +462,7 @@ describe("the extraction pipeline (extractor → auditor → merger)", () => {
 		const extractor = submitModel("submit_findings", {
 			propositions: FINDINGS.propositions,
 			chains: JSON.stringify(FINDINGS.chains),
+			attributions: [],
 		});
 		const pipeline = createExtractionPipeline({
 			chatStore,
@@ -759,6 +771,7 @@ describe("the extraction pipeline (extractor → auditor → merger)", () => {
 		const single = (id: string, name: string, statement: string) => ({
 			propositions: [{ id, name, statement, aliases: [], messageId: "a1" }],
 			chains: [],
+			attributions: [],
 		});
 		const findingsA = single("pa", "Alpha claim", "Alpha statement, full precision");
 		const findingsB = single("pb", "Beta claim", "Beta statement, full precision");
@@ -816,6 +829,7 @@ describe("the extraction pipeline (extractor → auditor → merger)", () => {
 		const single = (id: string, name: string, statement: string) => ({
 			propositions: [{ id, name, statement, aliases: [], messageId: "a1" }],
 			chains: [],
+			attributions: [],
 		});
 
 		let gateOpen!: () => void;
@@ -1074,6 +1088,7 @@ describe("message anchors (session propositions carry their passage's id)", () =
 			{ id: "p1", name: "Anchor claim", statement: "Anchor claim, full precision.", aliases: [], messageId },
 		],
 		chains: [],
+		attributions: [],
 	});
 
 	/** One scripted extractor turn: a submit_findings tool call. */
@@ -1096,6 +1111,7 @@ describe("message anchors (session propositions carry their passage's id)", () =
 					submitStep({
 						propositions: [{ id: "p1", name: "Anchor claim", statement: "Anchor claim, full precision.", aliases: [] }],
 						chains: [],
+						attributions: [],
 					}),
 				),
 			);
@@ -1302,6 +1318,7 @@ describe("the extractor redesign (owner, 2026-09-30): chains are the deliverable
 				{ id: "p3", name: "C", statement: "A and B together entail C.", aliases: [], messageId: "a1" },
 			],
 			chains: [{ premises: ["p1", "p2"], conclusion: "p3" }],
+			attributions: [],
 		});
 		const pipeline = createExtractionPipeline({
 			chatStore,
@@ -1337,6 +1354,7 @@ describe("the extractor redesign (owner, 2026-09-30): chains are the deliverable
 				{ premises: ["p1"], conclusion: "p3" },
 				{ premises: ["p2"], conclusion: "p3" },
 			],
+			attributions: [],
 		});
 		const pipeline = createExtractionPipeline({
 			chatStore,
@@ -2129,6 +2147,7 @@ describe("digest-aware serialized extraction (the extractor is the assembler)", 
 				const submit = {
 					propositions: FINDINGS_B.propositions,
 					chains: [{ premises: ["n_a", "p1"], conclusion: "p1b" }],
+					attributions: [],
 				};
 				// conclusion p1b must exist — real submit:
 				submit.propositions.push({ id: "p1b", name: "Property rights", statement: "d", aliases: [], messageId: "a2" });
@@ -2166,7 +2185,7 @@ describe("digest-aware serialized extraction (the extractor is the assembler)", 
 					[
 						fauxToolCall(
 							"submit_findings",
-							{ propositions: [], chains: [{ premises: ["n_nope"], conclusion: "also_nope" }] } as unknown as ToolCall["arguments"],
+							{ propositions: [], chains: [{ premises: ["n_nope"], conclusion: "also_nope" }], attributions: [] } as unknown as ToolCall["arguments"],
 							{ id: "bad" },
 						),
 					],
@@ -2180,6 +2199,7 @@ describe("digest-aware serialized extraction (the extractor is the assembler)", 
 							{
 								propositions: [{ id: "p1", name: "Axiom", statement: "s", aliases: [], messageId: "a1" }],
 								chains: [],
+								attributions: [],
 							} as unknown as ToolCall["arguments"],
 							{ id: "good" },
 						),
@@ -2329,6 +2349,7 @@ describe("chain simplification (the merger's maintenance pass, owner 2026-09-30 
 		const redundant: SessionFindings = {
 			propositions: [],
 			chains: [{ premises: ["n_a", "n_b", "n_c"], conclusion: "n_y" }],
+			attributions: [],
 		};
 		const pipeline = createExtractionPipeline({
 			chatStore,
@@ -2752,3 +2773,314 @@ function answerOf(toolCallId: string): LhMessage[] {
 		} as never,
 	];
 }
+
+// ─── held status from production evidence (#9 — the tracer bullet) ─────────
+//
+// Seam 2: chats in the real chat store, the in-memory ledgers, scripted
+// extractor/auditor; answers written straight through the port (the chat
+// handler's write is seam 1, chat-flow.test.ts). Read ONLY through the
+// prober's list_propositions output.
+
+/** A free-recall check with three key points (one per proposition). */
+function threePointCheck(toolCallId: string, question = "How does heat move between two bodies?"): NativeCallDesc {
+	return {
+		name: "explain",
+		toolCallId,
+		input: {
+			type: "check",
+			question,
+			correctAnswer: "From hot to cold, by collisions, until temperatures match.",
+			keyPoints: [
+				{ id: "k1", text: "Heat flows from hot to cold", kind: "fact", required: true },
+				{ id: "k2", text: "Molecular collisions carry it", kind: "reason", required: true },
+				{ id: "k3", text: "It stops at equal temperature", kind: "fact", required: false },
+			],
+		},
+		output: { kind: "explain", questionText: question, answeredAt: "2026-10-27T01:00:00.000Z" },
+	};
+}
+
+/** The three propositions the heat lesson teaches. */
+const HEAT_PROPOSITIONS = [
+	{ id: "p1", name: "Heat flows hot to cold", statement: "Heat flows spontaneously from a hotter body to a colder one.", aliases: [] },
+	{ id: "p2", name: "Collisions carry heat", statement: "Heat is carried by molecular collisions.", aliases: [] },
+	{ id: "p3", name: "Thermal equilibrium", statement: "Heat flow stops when temperatures are equal.", aliases: [] },
+];
+
+/** An extractor step submitting the given propositions and attributions,
+ *  every proposition anchored to the batch's first TEACHER passage. */
+function attributingStep(
+	propositions: Array<{ id: string; name: string; statement: string; aliases: string[] }>,
+	attributions: Array<{ check: string; keyPoint?: string; propositions: string[] }>,
+	capture?: (view: string) => void,
+): FauxResponseStep {
+	return (context) => {
+		const view = capturedView(context);
+		capture?.(view);
+		const anchor = /TEACHER \[([^\]]+)\]/.exec(view)?.[1] ?? "a1";
+		const submit = { propositions: propositions.map((p) => ({ ...p, messageId: anchor })), chains: [], attributions };
+		return fauxAssistantMessage(
+			[fauxToolCall("submit_findings", submit as unknown as ToolCall["arguments"], { id: "findings-call" })],
+			{ stopReason: "toolUse" },
+		);
+	};
+}
+
+/** One graded production answer, as the chat handler writes it. */
+function productionAnswer(
+	chatId: string,
+	toolCallId: string,
+	at: string,
+	statuses: Record<string, "present" | "absent" | "contradicted">,
+	over: Partial<AnswerEntry> = {},
+): AnswerEntry {
+	return {
+		type: "answer",
+		toolCallId,
+		chatId,
+		questionMessageId: "a1",
+		answerMessageId: `r_${toolCallId}`,
+		kind: "production",
+		phase: "teach",
+		dontKnow: false,
+		verdict: {
+			rationale: "by gist",
+			attempt: "answered",
+			points: Object.entries(statuses).map(([id, status]) => ({ id, status, evidence: "" })),
+			extraErrors: [],
+			uncertain: false,
+		},
+		at,
+		...over,
+	};
+}
+
+async function extractWith(chatId: string, ledgers: ReturnType<typeof memoryLedgers>, steps: FauxResponseStep[]) {
+	await createExtractionPipeline({
+		chatStore,
+		graphStore: ledgers,
+		extractor: fauxEngine(steps),
+		auditor: fauxEngine(steps.map(() => passThroughAuditStep())),
+	}).runExtraction(chatId);
+}
+
+async function listPropositions(ledgers: ReturnType<typeof memoryLedgers>, session: string): Promise<string> {
+	const tools = proberGraphTools({ chatStore, graphStore: ledgers });
+	return (await tools.list_propositions!.execute!("tc", { session })).details as string;
+}
+
+const PER_POINT = [
+	{ check: "q1", keyPoint: "k1", propositions: ["p1"] },
+	{ check: "q1", keyPoint: "k2", propositions: ["p2"] },
+	{ check: "q1", keyPoint: "k3", propositions: ["p3"] },
+];
+
+describe("held status from production evidence (#9)", () => {
+	it("attribution per key point: present → held, contradicted → misconception, absent → not held — one point's miss leaves another held", async () => {
+		const { chatId } = checksChat("Held fixture", [
+			...assistant("a1", [{ type: "text", text: "Heat flows from hot to cold by collisions until equilibrium." }, threePointCheck("call-heat")]),
+		]);
+		const ledgers = memoryLedgers();
+		ledgers.appendEvidence(productionAnswer(chatId, "call-heat", "2026-10-20T09:00:00.000Z", { k1: "present", k2: "contradicted", k3: "absent" }));
+		await extractWith(chatId, ledgers, [attributingStep(HEAT_PROPOSITIONS, PER_POINT)]);
+
+		const out = await listPropositions(ledgers, chatId);
+		assert.match(out, /^- Heat flows hot to cold — held \(2026-10-20\)$/m);
+		assert.match(out, /^- Collisions carry heat — misconception \(2026-10-20\)$/m);
+		assert.match(out, /^- Thermal equilibrium — not held \(2026-10-20\)$/m);
+		assert.ok(!out.includes("Heat flows spontaneously"), "names only — never the statement");
+	});
+
+	/** Two lessons' worth of checks on the same three propositions. */
+	function twoCheckChat(title: string) {
+		return checksChat(title, [
+			...assistant("a1", [{ type: "text", text: "Heat flows from hot to cold by collisions until equilibrium." }, threePointCheck("call-first")]),
+			user("u1", "ok"),
+			...assistant("a2", [{ type: "text", text: "Let us check that again later." }, threePointCheck("call-later", "Once more: how does heat move?")]),
+		]);
+	}
+	const BOTH_CHECKS = [...PER_POINT, ...PER_POINT.map((a) => ({ ...a, check: "q2" }))];
+
+	it("a later miss un-holds a proposition (most recent evidence by answer time)", async () => {
+		const { chatId } = twoCheckChat("Un-hold fixture");
+		const ledgers = memoryLedgers();
+		ledgers.appendEvidence(productionAnswer(chatId, "call-first", "2026-10-20T09:00:00.000Z", { k1: "present", k2: "present", k3: "present" }));
+		ledgers.appendEvidence(productionAnswer(chatId, "call-later", "2026-10-22T09:00:00.000Z", { k1: "absent", k2: "contradicted", k3: "present" }));
+		await extractWith(chatId, ledgers, [attributingStep(HEAT_PROPOSITIONS, BOTH_CHECKS)]);
+
+		const out = await listPropositions(ledgers, chatId);
+		assert.match(out, /^- Heat flows hot to cold — not held \(2026-10-22\)$/m);
+		assert.match(out, /^- Collisions carry heat — misconception \(2026-10-22\)$/m);
+		assert.match(out, /^- Thermal equilibrium — held \(2026-10-22\)$/m);
+	});
+
+	it("\"I don't know\" counts against every proposition attributed to the question", async () => {
+		const { chatId } = twoCheckChat("Don't-know fixture");
+		const ledgers = memoryLedgers();
+		ledgers.appendEvidence(productionAnswer(chatId, "call-first", "2026-10-20T09:00:00.000Z", { k1: "present", k2: "present", k3: "present" }));
+		const { verdict: _none, ...dontKnow } = productionAnswer(chatId, "call-later", "2026-10-23T09:00:00.000Z", {}, { dontKnow: true });
+		void _none;
+		ledgers.appendEvidence(dontKnow);
+		await extractWith(chatId, ledgers, [attributingStep(HEAT_PROPOSITIONS, BOTH_CHECKS)]);
+
+		const out = await listPropositions(ledgers, chatId);
+		for (const name of ["Heat flows hot to cold", "Collisions carry heat", "Thermal equilibrium"]) {
+			assert.match(out, new RegExp(`^- ${name} — not held \\(2026-10-23\\)$`, "m"));
+		}
+	});
+
+	it("an uncertain verdict is ignored: the evidence before it still decides", async () => {
+		const { chatId } = twoCheckChat("Uncertain fixture");
+		const ledgers = memoryLedgers();
+		ledgers.appendEvidence(productionAnswer(chatId, "call-first", "2026-10-20T09:00:00.000Z", { k1: "present", k2: "absent", k3: "present" }));
+		ledgers.appendEvidence(
+			productionAnswer(chatId, "call-later", "2026-10-24T09:00:00.000Z", {}, {
+				verdict: { rationale: "grader timed out", attempt: "answered", points: [], extraErrors: [], uncertain: true },
+			}),
+		);
+		await extractWith(chatId, ledgers, [attributingStep(HEAT_PROPOSITIONS, BOTH_CHECKS)]);
+
+		const out = await listPropositions(ledgers, chatId);
+		assert.match(out, /^- Heat flows hot to cold — held \(2026-10-20\)$/m);
+		assert.match(out, /^- Collisions carry heat — not held \(2026-10-20\)$/m);
+	});
+
+	it("an uncertain verdict alone leaves a proposition covered only", async () => {
+		const { chatId } = checksChat("Uncertain-only fixture", [
+			...assistant("a1", [{ type: "text", text: "Heat flows from hot to cold by collisions until equilibrium." }, threePointCheck("call-heat")]),
+		]);
+		const ledgers = memoryLedgers();
+		ledgers.appendEvidence(
+			productionAnswer(chatId, "call-heat", "2026-10-24T09:00:00.000Z", {}, {
+				verdict: { rationale: "invalid output", attempt: "answered", points: [], extraErrors: [], uncertain: true },
+			}),
+		);
+		await extractWith(chatId, ledgers, [attributingStep(HEAT_PROPOSITIONS, PER_POINT)]);
+		assert.match(await listPropositions(ledgers, chatId), /^- Heat flows hot to cold — covered only$/m);
+	});
+
+	it("an extra error counts against every proposition the answer's key points were attributed to", async () => {
+		const { chatId } = checksChat("Extra-error fixture", [
+			...assistant("a1", [{ type: "text", text: "Heat flows from hot to cold by collisions until equilibrium." }, threePointCheck("call-heat")]),
+		]);
+		const ledgers = memoryLedgers();
+		const answer = productionAnswer(chatId, "call-heat", "2026-10-21T09:00:00.000Z", { k1: "present", k2: "present", k3: "present" });
+		answer.verdict!.extraErrors = [{ claim: "Cold flows into hot bodies." }];
+		ledgers.appendEvidence(answer);
+		// k3 is left unattributed: only p1 and p2 were tested.
+		await extractWith(chatId, ledgers, [attributingStep(HEAT_PROPOSITIONS, PER_POINT.slice(0, 2))]);
+
+		const out = await listPropositions(ledgers, chatId);
+		assert.match(out, /^- Heat flows hot to cold — not held \(2026-10-21\)$/m);
+		assert.match(out, /^- Collisions carry heat — not held \(2026-10-21\)$/m);
+		assert.match(out, /^- Thermal equilibrium — covered only$/m, "an unattributed proposition is untouched");
+	});
+
+	it("probe evidence makes a proposition held though it was never taught", async () => {
+		// A probe-phase recall: the prober's own message, no teaching yet.
+		const { chatId } = checksChat("Probe-evidence fixture", [
+			...assistant("a1", [
+				{ type: "text", text: "Before we start, let me see what you already know about heat." },
+				{ ...threePointCheck("call-probe"), name: "recall" },
+			]),
+		]);
+		const ledgers = memoryLedgers();
+		ledgers.appendEvidence(
+			productionAnswer(chatId, "call-probe", "2026-10-19T09:00:00.000Z", { k1: "present", k2: "absent", k3: "absent" }, { phase: "probe" }),
+		);
+		await extractWith(chatId, ledgers, [attributingStep(HEAT_PROPOSITIONS.slice(0, 1), [{ check: "q1", keyPoint: "k1", propositions: ["p1"] }])]);
+		assert.match(await listPropositions(ledgers, chatId), /^- Heat flows hot to cold — held \(2026-10-19\)$/m);
+	});
+
+	it("propositions with no evidence: covered only when born in a session, encountered only from notes alone", async () => {
+		const { chatId } = checksChat("Covered-only fixture", [
+			...assistant("a1", [{ type: "text", text: "Heat flows from hot to cold by collisions until equilibrium." }]),
+		]);
+		const ledgers = memoryLedgers();
+		await extractWith(chatId, ledgers, [attributingStep(HEAT_PROPOSITIONS, [])]);
+		const session = await listPropositions(ledgers, chatId);
+		assert.match(session, /^3 proposition\(s\) born in this session:$/m);
+		assert.match(session, /^- Heat flows hot to cold — covered only$/m);
+
+		const notesFile = `${PATHS.chats}/../held-notes-${Date.now()}.md`;
+		const pipeline = createExtractionPipeline({
+			chatStore,
+			graphStore: ledgers,
+			extractor: submitModel("submit_findings", {
+				propositions: [{ id: "p1", name: "Entropy rises", statement: "The entropy of an isolated system never decreases.", aliases: [] }],
+				chains: [],
+			}),
+			auditor: submitModel("submit_review", { links: [] }),
+		});
+		await pipeline.importNotes({ filePath: notesFile, text: "Entropy of an isolated system never decreases." });
+		const source = ledgers.readSources()[0]!.id;
+		assert.match(await listPropositions(ledgers, source), /^- Entropy rises — encountered only$/m);
+	});
+
+	it("an answer to a check the extractor did not attribute is unattached evidence and moves no status", async () => {
+		const { chatId } = checksChat("Unattached fixture", [
+			...assistant("a1", [{ type: "text", text: "Heat flows from hot to cold by collisions until equilibrium." }, threePointCheck("call-heat")]),
+		]);
+		const ledgers = memoryLedgers();
+		ledgers.appendEvidence(productionAnswer(chatId, "call-heat", "2026-10-20T09:00:00.000Z", { k1: "present", k2: "present", k3: "present" }));
+		await extractWith(chatId, ledgers, [attributingStep(HEAT_PROPOSITIONS, [])]);
+
+		assert.match(await listPropositions(ledgers, chatId), /^- Heat flows hot to cold — covered only$/m);
+		assert.deepEqual(evidenceView(ledgers.readEvidence()).unattached.map((a) => a.toolCallId), ["call-heat"]);
+	});
+
+	it("an answer recorded before its question is extracted, and one recorded after, both end up attributed", async () => {
+		const { chatId } = twoCheckChat("Before/after fixture");
+		const ledgers = memoryLedgers();
+		// Recorded BEFORE extraction.
+		ledgers.appendEvidence(productionAnswer(chatId, "call-first", "2026-10-20T09:00:00.000Z", { k1: "present", k2: "absent", k3: "absent" }));
+		await extractWith(chatId, ledgers, [
+			attributingStep(HEAT_PROPOSITIONS.slice(0, 1), [
+				{ check: "q1", keyPoint: "k1", propositions: ["p1"] },
+				{ check: "q2", keyPoint: "k1", propositions: ["p1"] },
+			]),
+		]);
+		assert.match(await listPropositions(ledgers, chatId), /^- Heat flows hot to cold — held \(2026-10-20\)$/m);
+
+		// Recorded AFTER extraction: joins the attribution already in the ledger.
+		ledgers.appendEvidence(productionAnswer(chatId, "call-later", "2026-10-25T09:00:00.000Z", { k1: "absent", k2: "present", k3: "absent" }));
+		assert.match(await listPropositions(ledgers, chatId), /^- Heat flows hot to cold — not held \(2026-10-25\)$/m);
+		assert.deepEqual(evidenceView(ledgers.readEvidence()).unattached, [], "both answers are attributed");
+	});
+
+	it("an attribution naming a check outside the stretch, or a key point the check lacks, is refused back to the extractor", async () => {
+		const { chatId } = checksChat("Attribution law fixture", [
+			...assistant("a1", [{ type: "text", text: "Heat flows from hot to cold by collisions until equilibrium." }, threePointCheck("call-heat")]),
+		]);
+		const ledgers = memoryLedgers();
+		const errors: string[] = [];
+		const refusedThenFixed = (bad: Array<{ check: string; keyPoint?: string; propositions: string[] }>): FauxResponseStep[] => [
+			attributingStep(HEAT_PROPOSITIONS, bad),
+			(...args) => {
+				const last = (args[0] as { messages: Array<{ role: string; content: Array<{ text?: string }> }> }).messages.at(-1)!;
+				errors.push(last.content.map((c) => c.text ?? "").join(""));
+				const fixed = attributingStep(HEAT_PROPOSITIONS, PER_POINT) as Extract<FauxResponseStep, (...a: never[]) => unknown>;
+				return fixed(...args);
+			},
+		];
+		for (const bad of [
+			[{ check: "q9", keyPoint: "k1", propositions: ["p1"] }],
+			[{ check: "q1", keyPoint: "k7", propositions: ["p1"] }],
+			[{ check: "q1", propositions: ["p1"] }],
+			[{ check: "q1", keyPoint: "k1", propositions: ["n_elsewhere"] }],
+		]) {
+			await createExtractionPipeline({
+				chatStore,
+				graphStore: ledgers,
+				extractor: fauxEngine(refusedThenFixed(bad)),
+				auditor: fauxEngine([passThroughAuditStep()]),
+			}).runExtraction(chatId);
+			ledgers.rewriteLedgers({ coverage: [] }); // re-open a1 for the next case
+		}
+		assert.equal(errors.length, 4, "each bad submit was refused once, then the fix merged");
+		assert.match(errors[0]!, /"q9" is not a check of THIS stretch/);
+		assert.match(errors[1]!, /no key point "k7"/);
+		assert.match(errors[2]!, /attribute it per key point/);
+		assert.match(errors[3]!, /"n_elsewhere" is not a proposition id of this submission/);
+	});
+});
