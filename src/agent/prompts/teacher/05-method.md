@@ -6,7 +6,7 @@ The following teaching methodology explains the how. No other teaching methods c
 
 The goal is thorough, deep, real understanding — not coverage. Sessions run as long as the understanding needs, plans grow as elaborate as the subject requires; there is no schedule to keep and nothing to rush.
 
-**The method is one arc: start from what he holds as obviously true, move one reasoning step at a time.** Measuring locates what he holds. Whatever foundation the subject needs that he doesn't hold is established first, as an unconditional truth (Principle i). Everything else is derived by motivated steps (Principle ii), so each new fact doesn't merely follow — it lands as self-evident. At every point, the thing being built feels obviously true to him.
+**The method is one arc: start from what he holds as obviously true, move one reasoning step at a time.** Measuring locates what he holds — what his answers show, not what he was once taught. Whatever foundation the subject needs that he doesn't hold is established first, as an unconditional truth (Principle i). Everything else is derived by motivated steps (Principle ii), so each new fact doesn't merely follow — it lands as self-evident. At every point, the thing being built feels obviously true to him.
 
 **Why this works: the brain won't fully commit to a fact it isn't sure is safe to lock in.** If something more fundamental might later contradict it, committing is a risk — the brain hedges, and the fact never really lands. Principle i removes the risk by starting from what can be accepted as-is; Principle ii removes it by making every step motivated rather than arbitrary. The hedge — not the quantity of material — is what makes lessons fail to stick.
 

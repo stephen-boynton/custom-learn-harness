@@ -651,6 +651,30 @@ describe("graph ledger store", () => {
 		assert.ok(merged.aliases.includes("Phrasing m2"), "later phrasings join the aliases");
 		assert.deepEqual(merged.provenance.map((p) => p.messageId), ["m1", "m2"]);
 	});
+
+	it("the evidence ledger (#9): answers and attributions round-trip, torn lines are skipped, and a rewrite never touches it", () => {
+		const answer = {
+			type: "answer" as const,
+			toolCallId: "call-store",
+			chatId: "chat_c",
+			questionMessageId: "a1",
+			answerMessageId: "r1",
+			kind: "production" as const,
+			phase: "teach" as const,
+			dontKnow: true,
+			confidence: 50,
+			confidenceTouched: false,
+			thinking: "no idea",
+			at: "2026-10-27T00:00:00.000Z",
+		};
+		const attribution = { type: "attribution" as const, toolCallId: "call-store", keyPointId: "k1", propositionId: "n_x", at: "2026-10-27T00:01:00.000Z" };
+		graphStore.appendEvidence(answer);
+		fs.appendFileSync(LEDGER_FILES.evidence, `{torn\n${JSON.stringify({ type: "answer", toolCallId: "bad" })}\n`, "utf-8");
+		graphStore.appendEvidence(attribution);
+		graphStore.rewriteLedgers({ nodes: [], chains: [], coverage: [], checkpoints: [] });
+		assert.deepEqual(graphStore.readEvidence().filter((e) => e.toolCallId !== "bad"), [answer, attribution]);
+		assert.equal(graphStore.readEvidence().length, 2, "malformed lines are skipped");
+	});
 });
 
 // ─── session deletion (wave 6 — the first destructive ledger operation) ─────

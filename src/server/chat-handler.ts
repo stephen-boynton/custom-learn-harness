@@ -44,7 +44,8 @@ import { beginTurn, endTurn } from "./turn-liveness.ts";
 import { applyParkedDismissal } from "./dismissal-park.ts";
 import { registerTurn, rememberTurnFailure, unregisterTurn } from "./turn-runs.ts";
 import { persistTurn, triggerExtraction, TurnPersistenceError } from "./turn-service.ts";
-import { hasProbeDone, danglingQuestionOf } from "../core/native-messages.ts";
+import { hasProbeDone, danglingQuestionOf, type LhMessage } from "../core/native-messages.ts";
+import { answerEntryFor } from "../core/evidence.ts";
 import { composeInstructions } from "../agent/teacher-agent.ts";
 import { ensureCompacted, kickCompaction, effectiveThresholdTokens } from "./compaction.ts";
 import { catalogContextLimits, refreshConnectionCatalog } from "./model-catalog.ts";
@@ -349,6 +350,20 @@ export async function handleChatInput(
 			console.error(`[chat ${chatId}] grader usage append failed:`, err);
 		}
 	};
+	/** THE EVIDENCE LEDGER (spec #2, #9): once the answer is durably saved,
+	 *  a graded production answer becomes an answer entry, read off the
+	 *  saved record. The transcript stays the source of truth — a failed
+	 *  ledger append is logged, never turned into a failed answer. */
+	const recordAnswerEvidence = (saved: readonly LhMessage[]) => {
+		if (input.type !== "answer") return;
+		const entry = answerEntryFor(chatId, saved, input.toolCallId, new Date().toISOString());
+		if (!entry) return;
+		try {
+			stores.graphStore.appendEvidence(entry);
+		} catch (err) {
+			console.error(`[chat ${chatId}] evidence append failed:`, err);
+		}
+	};
 
 	if (input.type === "answer" && danglingQuestionOf([...record.messages, ...appends]) !== null) {
 		const merged = [...record.messages, ...appends];
@@ -359,6 +374,7 @@ export async function handleChatInput(
 			return new Response("Your input could not be saved. Please try again.", { status: 500 });
 		}
 		recordGraderSpend();
+		recordAnswerEvidence(merged);
 		if (turnBegun) endTurn(chatId);
 		emit("record-changed", { chatId });
 		return settledTurnResponse(); // the cheap terminal — no beginTurn, no turn
@@ -383,6 +399,7 @@ export async function handleChatInput(
 		return new Response("Your input could not be saved. Please try again.", { status: 500 });
 	}
 	recordGraderSpend();
+	recordAnswerEvidence(merged);
 	// Visibility bookkeeping is not the canonical save. Its failure must
 	// neither misreport a saved input as lost nor prevent the turn running.
 	try {

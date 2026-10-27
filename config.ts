@@ -67,6 +67,10 @@ export const LEDGER_FILES = {
 	 *  the checkpoint's replacement for chat extractions — notes keep
 	 *  sessions.jsonl, whole-file as they are). */
 	coverage: path.join(PATHS.graph, "coverage.jsonl"),
+	/** The evidence ledger (contracts/graph.ts EvidenceEntry, spec #2):
+	 *  answers and attributions, append-only and NEVER rewritten — it has
+	 *  no rewriteLedgers key. */
+	evidence: path.join(PATHS.graph, "evidence.jsonl"),
 } as const;
 
 /**

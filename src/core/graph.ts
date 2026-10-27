@@ -67,6 +67,7 @@ import type {
 import { MIN_CLUSTER_SIZE } from "./clusters.ts";
 import { formatChainLine } from "./chains.ts";
 import { attachImpToCommunities, birthSessionOf, birthSessionPartition } from "./session-clusters.ts";
+import { evidenceView, type PropositionEvidence } from "./evidence.ts";
 import type { ChatStore, GraphStore } from "./ports.ts";
 
 /** The storage ports every graph operation needs, passed explicitly. */
@@ -272,6 +273,25 @@ export function mergeFindings(
 	if (keptChains.length !== allChains.length) {
 		ledgers.rewriteLedgers({ chains: keptChains });
 		stats.droppedChains = allChains.length - keptChains.length;
+	}
+
+	// 2c. Attributions (spec #2, #9) — one evidence-ledger line per
+	//     (check, key point, proposition), each target resolved through
+	//     THIS job's map (a target the auditor linked to an existing node
+	//     lands on that node). Written BEFORE the checkpoint: a failure
+	//     leaves the batch uncovered, so it re-runs and attributes again.
+	for (const attribution of findings.attributions ?? []) {
+		const targets = new Set(attribution.propositions.map((local) => mapping.get(local)));
+		for (const propositionId of targets) {
+			if (propositionId === undefined) continue; // not a proposition of this submission
+			ledgers.appendEvidence({
+				type: "attribution",
+				toolCallId: attribution.toolCallId,
+				...(attribution.keyPointId !== undefined ? { keyPointId: attribution.keyPointId } : {}),
+				propositionId,
+				at: now,
+			});
+		}
 	}
 
 	// 3. Checkpoint — THE COVERAGE DISCIPLINE (vision-extraction-coverage.md):
@@ -681,6 +701,21 @@ export function graphSessionPropositions(deps: GraphDeps, sessionId: string): Gr
 	const born = getGraph(deps.graphStore).nodes.filter((node) => birthSessionOf(node) === sessionId);
 	return born
 		.map((node) => ({ nodeId: node.id, name: node.name }))
+		.sort((a, b) => (a.nodeId < b.nodeId ? -1 : 1));
+}
+
+/** A birth proposition with its held status (spec #2, #9) — the prober's
+ *  view: derived from the evidence ledger on read, never stored. */
+export interface GraphSessionPropositionStatus extends GraphSessionProposition, PropositionEvidence {}
+
+/** The propositions BORN in one session, each with its status and the
+ *  timestamp of the evidence that decided it. Same order as
+ *  graphSessionPropositions. */
+export function graphSessionStatuses(deps: GraphDeps, sessionId: string): GraphSessionPropositionStatus[] {
+	const evidence = evidenceView(deps.graphStore.readEvidence());
+	const born = getGraph(deps.graphStore).nodes.filter((node) => birthSessionOf(node) === sessionId);
+	return born
+		.map((node) => ({ nodeId: node.id, name: node.name, ...evidence.statusOf(node) }))
 		.sort((a, b) => (a.nodeId < b.nodeId ? -1 : 1));
 }
 

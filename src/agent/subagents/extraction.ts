@@ -28,7 +28,7 @@ import type { GraphStore } from "../../core/ports.ts";
 import { emit } from "../../core/events.ts";
 import { settleGraphLayout } from "../../core/layout-settle.ts";
 import { batchRuns, coverageOf, coverageSlots, messageViewLines } from "../../core/coverage.ts";
-import { extractionViewOf } from "../../core/check-view.ts";
+import { extractionViewOf, type ViewCheck } from "../../core/check-view.ts";
 import { failedOutputCallIds, type LhMessage } from "../../core/native-messages.ts";
 import { auditorGraphTools } from "../tools/graph.ts";
 import { runSubmitAgent, healStringifiedArrays } from "./submit-agent.ts";
@@ -217,12 +217,43 @@ const sessionPropositionProps = {
 	}),
 };
 
+// ATTRIBUTION (spec #2, #9 — drafted, pending owner review): each check
+// in the stretch names the propositions of THIS submission it tested —
+// per key point for a free-recall check, as a whole for a multiple-choice
+// check or prediction (owner, 2026-10-27). Checks are addressed by their
+// batch-local alias (q1, …), never a raw toolCallId; the pipeline maps
+// the alias back (core/check-view.ts).
+const attributionSchema = Type.Object({
+	check: Type.String({ description: 'The check\'s label, copied from its "CHECK q…" line (e.g. "q1").' }),
+	keyPoint: Type.Optional(
+		Type.String({
+			description:
+				"Free-recall checks only: the id of ONE key point, exactly as listed under the check. Omit it for a " +
+				"multiple-choice check, which is attributed as a whole.",
+		}),
+	),
+	propositions: Type.Array(Type.String(), {
+		minItems: 1,
+		description:
+			"The ids of the propositions in THIS submission that this key point (or check) tests — only what a " +
+			"correct answer would itself show, never the premises behind it.",
+	}),
+});
+
+const attributionsDescription =
+	"For each check in this stretch, the propositions of this submission it tests, judged from the question " +
+	"alone: one entry per key point of a free-recall check, one entry per multiple-choice check. Leave out a " +
+	"check or key point that tests none of them; pass [] when there are none — never omit the field.";
+
 const sessionFindingsSchema = Type.Object({
 	propositions: Type.Array(Type.Object(sessionPropositionProps), {
 		description: propositionsDescription,
 	}),
 	chains: Type.Array(chainSchema, {
 		description: chainsDescription,
+	}),
+	attributions: Type.Array(attributionSchema, {
+		description: attributionsDescription,
 	}),
 });
 
@@ -343,6 +374,52 @@ function validateSessionAnchors(value: SessionFindingsSubmit, batchIds: Readonly
 	return null;
 }
 
+/** The ATTRIBUTION law (#9): every attribution names a check of THIS
+ *  stretch by its alias; a free-recall check is attributed per key point
+ *  (an id it actually lists), a multiple-choice check as a whole (no key
+ *  point); every target is a proposition of THIS submission. Refusals
+ *  ride the error-back channel like the anchor law. */
+function validateAttributions(value: SessionFindingsSubmit, checks: ReadonlyArray<ViewCheck>): string | null {
+	const ids = new Set(value.propositions.map((p) => p.id));
+	const byAlias = new Map(checks.map((c) => [c.alias, c]));
+	for (const a of value.attributions) {
+		const check = byAlias.get(a.check);
+		if (!check) {
+			return `attributions: "${a.check}" is not a check of THIS stretch — copy the label from one of its "CHECK q…" lines.`;
+		}
+		if (check.keyPointIds.length > 0) {
+			if (a.keyPoint === undefined) {
+				return `attributions: check "${a.check}" is free recall — attribute it per key point (${check.keyPointIds.join(", ")}), one entry each.`;
+			}
+			if (!check.keyPointIds.includes(a.keyPoint)) {
+				return `attributions: check "${a.check}" has no key point "${a.keyPoint}" — use one of ${check.keyPointIds.join(", ")}.`;
+			}
+		} else if (a.keyPoint !== undefined) {
+			return `attributions: check "${a.check}" is multiple choice — attribute it as a whole, without a keyPoint.`;
+		}
+		const unknown = a.propositions.find((id) => !ids.has(id));
+		if (unknown !== undefined) {
+			return `attributions: "${unknown}" is not a proposition id of this submission — attribute only to propositions you are submitting.`;
+		}
+	}
+	return null;
+}
+
+/** The session lift (#9): attributions leave the wire with their check
+ *  alias resolved to the call's toolCallId — downstream never sees an
+ *  alias. Validation already guaranteed every alias resolves. */
+function withAttributions(findings: SessionFindings, raw: SessionFindingsSubmit, checks: ReadonlyArray<ViewCheck>): SessionFindings {
+	const byAlias = new Map(checks.map((c) => [c.alias, c.toolCallId]));
+	return {
+		...findings,
+		attributions: raw.attributions.flatMap((a) => {
+			const toolCallId = byAlias.get(a.check);
+			if (toolCallId === undefined) return [];
+			return [{ toolCallId, ...(a.keyPoint !== undefined ? { keyPointId: a.keyPoint } : {}), propositions: [...a.propositions] }];
+		}),
+	};
+}
+
 /** (chains-primary, owner 2026-09-30) the wire IS the pipeline shape
  *  now: propositions + chains, no translation — the stores keep the
  *  chains and the derived edge view is recomputed on read. The fill
@@ -388,11 +465,14 @@ export const SESSION_MESSAGE_ID_RULE =
  *  review): CHECK blocks (core/check-view.ts) are context, never a
  *  source — the graph is still built from teaching alone, and anchors
  *  still name TEACHER passages (validateSessionAnchors). What the
- *  extractor does WITH a check (attribution) is #9's to add. */
+ *  extractor does WITH a check is ATTRIBUTION (#9 — drafted, pending
+ *  owner review): name the propositions each one tested, nothing more. */
 export const SESSION_CHECKS_RULE =
 	"Blocks labeled CHECK are questions the teacher posed to the learner, shown as posed, without the learner's " +
 	"answers. They are context only: never extract a proposition from a check, and messageId always names a " +
-	"TEACHER passage.";
+	"TEACHER passage. Instead, attribute each check: for every key point of a free-recall check, and for every " +
+	"multiple-choice check as a whole, list the propositions of your submission it tests. Judge from the question " +
+	"alone, and name only what a correct answer would itself show — never the premises behind it.";
 
 export const SESSION_PREAMBLE =
 	"You are the extraction stage of a learning application. You read one stretch of a source — a teaching " +
@@ -473,13 +553,16 @@ export function sourceDigest(graph: DerivedGraph, sourceId: string): string {
 /** The extractor over ONE session transcript (the chat front door).
  *  `batchIds` — the CURRENT batch's teacher-prose message ids — is the
  *  anchor boundary: every submitted proposition's messageId must name
- *  one of them (validateSessionAnchors at the submit seam). */
+ *  one of them (validateSessionAnchors at the submit seam). `checks` —
+ *  the checks travelling with the batch — is the attribution boundary
+ *  (validateAttributions) and the alias → toolCallId map. */
 function runExtractor(
 	engine: PiEngine | undefined,
 	sourceId: string,
 	prompt: string,
 	existingIds: ReadonlySet<string>,
 	batchIds: ReadonlySet<string>,
+	checks: ReadonlyArray<ViewCheck>,
 	signal: AbortSignal | undefined,
 	onStep: (usage: Usage, model: string, step: number, finishReason: string, tools: string) => void,
 ): Promise<SessionFindings> {
@@ -496,7 +579,8 @@ function runExtractor(
 		toolDescription: "Submit the session findings.",
 		parameters: sessionFindingsSchema,
 		fill: fillFindings,
-		validate: (value) => validateSessionAnchors(value, batchIds) ?? validateFindingsChains(value, existingIds),
+		validate: (value) =>
+			validateSessionAnchors(value, batchIds) ?? validateFindingsChains(value, existingIds) ?? validateAttributions(value, checks),
 		systemPrompt: EXTRACTOR_INSTRUCTIONS,
 		prompt,
 		engine,
@@ -504,7 +588,7 @@ function runExtractor(
 		onStep,
 		neverSubmitted: "the extractor never submitted findings",
 		prepareArguments: healStringifiedArrays,
-	}).then(asSessionFindings);
+	}).then((raw) => withAttributions(asSessionFindings(raw), raw, checks));
 }
 
 /** The extractor over ONE source of raw personal notes (the format-agnostic
@@ -922,6 +1006,7 @@ export function createExtractionPipeline(deps: ExtractionPipelineDeps): Extracti
 		sourceId: string,
 		view: string,
 		batchIds: ReadonlySet<string>,
+		checks: ReadonlyArray<ViewCheck>,
 	): Promise<SessionFindings> {
 		const signal = runningExtractions.get(jobKey)?.controller.signal;
 		signal?.throwIfAborted(); // an abort during a sync gap ends the job here
@@ -946,6 +1031,7 @@ export function createExtractionPipeline(deps: ExtractionPipelineDeps): Extracti
 			prompt,
 			new Set(graph.nodes.map((n) => n.id)),
 			batchIds,
+			checks,
 			signal,
 			(usage, model, step, finishReason, tools) => {
 				recordStep(jobKey, "extractor", callUsage(usage), model);
@@ -1161,9 +1247,11 @@ export function createExtractionPipeline(deps: ExtractionPipelineDeps): Extracti
 							// labeled with its ACTUAL message id (2026-10-13) in exactly
 							// the lines the coverage fingerprints hash ("TEACHER [id]
 							// text"), plus the checks travelling with it as posed
-							// (ADR-0004: "CHECK q1 [id]" blocks, context only).
+							// (ADR-0004: "CHECK q1 [id]" blocks, context only — the
+							// extractor attributes them by alias, #9).
 							const messages = batch.map((slot) => slot.message);
-							const view = renderView(extraction.viewOf(batch).lines, record.title);
+							const batchView = extraction.viewOf(batch);
+							const view = renderView(batchView.lines, record.title);
 							// The batch's teacher-prose ids — the ONLY anchors this
 							// job's submit may name (validateSessionAnchors at the
 							// submit seam refuses anything else: ids from other
@@ -1175,7 +1263,7 @@ export function createExtractionPipeline(deps: ExtractionPipelineDeps): Extracti
 							setPhase(jobKey, "queued", "chat", undefined, part);
 							const findings = await withExtractSlot(jobKey, async () => {
 								setPhase(jobKey, "extracting", "chat", undefined, part);
-								return extract(jobKey, chatId, view, batchIds);
+								return extract(jobKey, chatId, view, batchIds, batchView.checks);
 							});
 							// SERIALIZED AUDIT (owner, 2026-09-28): audit + merge are the
 							// graph-mutating critical section — one job at a time,
