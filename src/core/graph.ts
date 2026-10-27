@@ -294,7 +294,9 @@ export function mergeFindings(
 	//     verbatim when it names an existing node (an earlier batch's idea
 	//     from THE GRAPH SO FAR, #11). Written BEFORE the checkpoint: a
 	//     failure leaves the batch uncovered, so it re-runs and attributes
-	//     again.
+	//     again. Every line carries THIS merge's run id: on read, a
+	//     question's newest run replaces its earlier ones (#11).
+	const runId = `run_${randomBytes(6).toString("hex")}`;
 	for (const attribution of findings.attributions ?? []) {
 		const targets = new Set(
 			attribution.propositions.map(
@@ -309,6 +311,7 @@ export function mergeFindings(
 				...(attribution.keyPointId !== undefined ? { keyPointId: attribution.keyPointId } : {}),
 				propositionId,
 				at: now,
+				runId,
 			});
 		}
 	}

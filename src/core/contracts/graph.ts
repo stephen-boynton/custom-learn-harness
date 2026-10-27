@@ -338,6 +338,10 @@ export interface AttributionEntry {
 	propositionId: string;
 	/** ISO — the merge that wrote it. */
 	at: string;
+	/** The merge that wrote it (#11, owner 2026-10-27): one id per merger
+	 *  write. Re-extraction attributes a check afresh; on read only the
+	 *  NEWEST run's attributions of a question count (core/evidence.ts). */
+	runId: string;
 }
 
 export type EvidenceEntry = AnswerEntry | AttributionEntry;

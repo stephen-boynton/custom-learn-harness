@@ -3200,3 +3200,44 @@ describe("checks on earlier-batch ideas (#11)", () => {
 		assert.match(await listPropositions(ledgers, elsewhere), /^- Heat flows hot to cold — covered only$/m);
 	});
 });
+
+describe("re-extraction: the newest run's attributions win (#11)", () => {
+	it("re-extracting a message replaces its checks' attributions, and the earlier entries stay in the ledger", async () => {
+		const { chatId } = checksChat("Re-attribution fixture", [
+			...assistant("a1", [{ type: "text", text: "Heat flows from hot to cold by collisions until equilibrium." }, threePointCheck("call-heat")]),
+		]);
+		const ledgers = memoryLedgers();
+		ledgers.appendEvidence(productionAnswer(chatId, "call-heat", "2026-10-20T09:00:00.000Z", { k1: "present", k2: "contradicted", k3: "absent" }));
+		await extractWith(chatId, ledgers, [
+			attributingStep(HEAT_PROPOSITIONS, [
+				{ check: "q1", keyPoint: "k1", propositions: ["p1"] },
+				{ check: "q1", keyPoint: "k2", propositions: ["p2"] },
+			]),
+		]);
+		const before = await listPropositions(ledgers, chatId);
+		assert.match(before, /^- Heat flows hot to cold — held \(2026-10-20\)$/m);
+		assert.match(before, /^- Collisions carry heat — misconception \(2026-10-20\)$/m);
+
+		// The teacher's prose changes → a1 re-opens; its check travels with
+		// it again and is attributed afresh: k2 now to the equilibrium idea
+		// (named by id from the digest), k1 to nothing.
+		const reopened = chatStore.getChat(chatId)!.messages.map((m) =>
+			m.id === "a1" && m.role === "assistant" ? ({ ...m, content: [{ type: "text", text: "Heat flows until temperatures are equal." }, ...m.content] } as LhMessage) : m,
+		);
+		chatStore.saveMessages(chatId, reopened);
+		await extractWith(chatId, ledgers, [
+			(...args) => {
+				const equilibrium = digestIdOf(capturedView(args[0]), "Thermal equilibrium") ?? "missing";
+				const step = attributingStep([], [{ check: "q1", keyPoint: "k2", propositions: [equilibrium] }]);
+				return (step as Extract<FauxResponseStep, (...a: never[]) => unknown>)(...args);
+			},
+		]);
+
+		const after = await listPropositions(ledgers, chatId);
+		assert.match(after, /^- Heat flows hot to cold — covered only$/m, "k1's old attribution no longer counts");
+		assert.match(after, /^- Collisions carry heat — covered only$/m, "k2's old target is replaced, not joined");
+		assert.match(after, /^- Thermal equilibrium — misconception \(2026-10-20\)$/m);
+		const attributions = ledgers.readEvidence().filter((e) => e.type === "attribution");
+		assert.equal(attributions.length, 3, "append-only: both runs' entries remain");
+	});
+});

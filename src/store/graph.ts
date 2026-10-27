@@ -139,7 +139,7 @@ const EVIDENCE_PHASES = new Set(["probe", "teach"]);
 const isEvidenceEntry = (v: unknown): v is EvidenceEntry => {
 	if (!isRecord(v) || !isString(v.toolCallId) || !isString(v.at)) return false;
 	if (v.type === "attribution") {
-		return isString(v.propositionId) && (v.keyPointId === undefined || isString(v.keyPointId));
+		return isString(v.propositionId) && isString(v.runId) && (v.keyPointId === undefined || isString(v.keyPointId));
 	}
 	return (
 		v.type === "answer" &&
