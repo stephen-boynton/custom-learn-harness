@@ -7,6 +7,7 @@ import {
 	explainInputBase,
 	explainInputObject,
 	explainInputProblems,
+	keyPointProblems,
 	parseOptionsIfString,
 	probeQuizInputSchema,
 	quizInputObject,
@@ -229,7 +230,7 @@ export function teachExplainToolFor(
 		prepareArguments: prepareQuestionArguments,
 		executionMode: "sequential",
 		execute: async (_toolCallId, input) => {
-			const problems = [...explainInputProblems(input)];
+			const problems = [...explainInputProblems(input), ...keyPointProblems(input.keyPoints)];
 			const nodeIdProblemText = nodeIdProblem(ctx, input.nodeId);
 			if (nodeIdProblemText) problems.push(nodeIdProblemText);
 			if (problems.length > 0) return invalidInputResult("explain", problems);
@@ -254,7 +255,7 @@ export const probeExplainTool: AgentTool<typeof explainInputBase> = {
 	prepareArguments: prepareQuestionArguments,
 	executionMode: "sequential",
 	execute: async (_toolCallId, input) => {
-		const problems = explainInputProblems(input);
+		const problems = [...explainInputProblems(input), ...keyPointProblems(input.keyPoints)];
 		if (problems.length > 0) return invalidInputResult("recall", problems);
 		return questionResult();
 	},

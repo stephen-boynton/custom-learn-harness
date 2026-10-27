@@ -30,6 +30,7 @@ import {
 	questionNeedsReveal,
 	type QuestionData,
 } from "../src/core/question-core.ts";
+import { parseExplainInput } from "../src/core/tool-parts.ts";
 
 const quizInput = {
 	question: "Which planet is closest to the sun?",
@@ -562,6 +563,38 @@ describe("AnsweredCard: the explain variant", () => {
 	it("renders his free text as the answer", () => {
 		const html = renderToStaticMarkup(<AnsweredCard answer={buildAnswer(explainQD(), { text: "Something about relativity?" })} />);
 		assert.match(html, /Something about relativity\?/);
+	});
+
+	it("an \"I don't know\" answer says so, as on a quiz (owner, 2026-10-27)", () => {
+		const html = renderToStaticMarkup(<AnsweredCard answer={buildAnswer(explainQD(), { dontKnow: true }, "recall")} />);
+		assert.match(html, /Answered “I don&#x27;t know”\./);
+	});
+
+	it("old records without key points still load and render (spec #2: no backfill)", () => {
+		const oldCall = {
+			question: "Explain why the null result matters.",
+			correctAnswer: "It ruled out the luminiferous aether.",
+		};
+		assert.ok(parseExplainInput(oldCall), "a pre-key-point call still parses");
+		const dock = renderDock({ toolName: "recall", toolCallId: "old-1", input: oldCall as never });
+		assert.ok(!dock.includes("malformed-question"), "the dock arms an old pending recall");
+		assert.match(dock, /Explain why the null result matters\./);
+		const card = renderToStaticMarkup(
+			<AnsweredCard answer={buildAnswer(explainQD(), { text: "A hand-wave." }, "recall")} input={oldCall} />,
+		);
+		assert.match(card, /The answer:/);
+		assert.match(card, /luminiferous aether/);
+	});
+
+	it("a key-point list the boundary healed from a JSON string still renders (the display mirror)", () => {
+		const healedAtBoundary = {
+			question: "Explain why the null result matters.",
+			correctAnswer: "It ruled out the luminiferous aether.",
+			keyPoints: JSON.stringify([{ id: "p1", text: "No aether.", kind: "fact", required: true }]),
+		};
+		assert.deepEqual(parseExplainInput(healedAtBoundary)?.keyPoints, [
+			{ id: "p1", text: "No aether.", kind: "fact", required: true },
+		]);
 	});
 
 });

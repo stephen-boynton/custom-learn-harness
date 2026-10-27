@@ -300,6 +300,38 @@ export const quizDisplayInputSchema = Type.Object({
 // Mechanics doctrine lives in the TOOL DESCRIPTIONS (pi-native ruling),
 // not in the system prompt.
 
+/** The key-point limit (spec #2, ADR-0003): 1–4 gradeable propositions
+ *  per commitment. */
+export const MAX_KEY_POINTS = 4;
+
+/** ONE key point of a commitment (spec #2, owner naming 2026-10-27):
+ *  a model-authored id ("p1"), the text of one proposition, its kind, and
+ *  whether the answer can pass without it. */
+const keyPointSchema = Type.Object({
+	id: Type.String({ description: 'A short id, unique within this list (e.g. "p1").' }),
+	text: Type.String({ description: "ONE proposition the full answer contains, stated on its own." }),
+	kind: Type.Union([Type.Literal("fact"), Type.Literal("reason")], {
+		description: "fact = what is the case; reason = why it is the case (the mechanism or justification).",
+	}),
+	required: Type.Boolean({
+		description: "true when an answer cannot pass without this point; false when it is credited but not required.",
+	}),
+});
+
+export type KeyPoint = Static<typeof keyPointSchema>;
+
+/** The key-point list as the tools declare it (required, 1–4 items —
+ *  the cross-item rules live in keyPointProblems, at the call boundary). */
+const keyPointsSchema = Type.Array(keyPointSchema, {
+	minItems: 1,
+	maxItems: MAX_KEY_POINTS,
+	description:
+		"REQUIRED. The commitment's key points: 1–" + MAX_KEY_POINTS + " items as a JSON ARRAY of objects — never a " +
+		"JSON-encoded string. Each is ONE proposition from correctAnswer, committed with it before the learner sees " +
+		"the question; an independent grader judges his answer against each point separately. Ids must be unique, and " +
+		"at least one point must be required. A list that breaks these rules is returned to you to fix.",
+});
+
 export const explainInputBase = Type.Object({
 	question: Type.String({
 		description:
@@ -308,10 +340,12 @@ export const explainInputBase = Type.Object({
 	correctAnswer: Type.String({
 		description:
 			"REQUIRED. The full correct answer in your own words, reasoning included — COMMITTED before the learner " +
-			"ever sees the question. The commitment is immutable: when his answer returns, grade it strictly against this " +
-			"text — never revise the commitment after seeing his words, and never mark a wrong answer right to be kind. " +
-			"It is shown to him on submit; your next reply grades the nuance of what he wrote.",
+			"ever sees the question. The commitment is immutable: never revise it after seeing his words. " +
+			"It is shown to him on submit.",
 	}),
+	// Right after correctAnswer (owner, 2026-10-27): the key points are
+	// distilled from the full answer, so they are authored after it.
+	keyPoints: keyPointsSchema,
 	details: Type.Optional(
 		Type.String({ description: "Optional extra context or instructions shown under the question." }),
 	),
@@ -345,15 +379,36 @@ export const explainInputObject = Type.Object({
 export const explainDisplayInputSchema = Type.Object({
 	...explainInputBase.properties,
 	type: Type.Optional(Type.String()),
+	// OPTIONAL here (spec #2): records created before key points existed
+	// carry none and must still parse and render — no backfill.
+	keyPoints: Type.Optional(keyPointsSchema),
 });
 
 /** The explain authoring contract: the commitment must exist. Empty
- *  result = an explain the dock can arm and the model can grade against. */
+ *  result = an explain the dock can arm. Display-safe — old records with
+ *  no key points pass it; the key-point rules are keyPointProblems. */
 export function explainInputProblems(input: { correctAnswer: string }): string[] {
 	if (input.correctAnswer.trim().length === 0) {
 		return ["correctAnswer is required — commit to the full correct answer BEFORE posing the question."];
 	}
 	return [];
+}
+
+/** The key-point rules TypeBox cannot carry (spec #2): unique ids and at
+ *  least one required point. The count (1–4) is structural — the schema
+ *  rejects it before execute runs. Boundary-only: the display parse never
+ *  runs it, so a record that predates key points still renders. */
+export function keyPointProblems(keyPoints: readonly KeyPoint[]): string[] {
+	const problems: string[] = [];
+	const seen = new Set<string>();
+	for (const point of keyPoints) {
+		if (seen.has(point.id)) problems.push(`duplicate key point id "${point.id}" — every key point id must be unique.`);
+		seen.add(point.id);
+	}
+	if (keyPoints.length > 0 && !keyPoints.some((point) => point.required)) {
+		problems.push("no key point is required — mark at least one key point `required: true`.");
+	}
+	return problems;
 }
 
 /** The tool names that carry the quizzing mechanic — the teach seam
@@ -425,6 +480,9 @@ export interface QuestionData {
 	correctIndices?: number[];
 	// explain only. NEVER send to the client before answering:
 	committedAnswer?: string;
+	// explain only, with the commitment (absent on records that predate
+	// key points). NEVER send to the client before answering:
+	keyPoints?: KeyPoint[];
 	// quiz only (the MC "why"). NEVER send to the client before answering:
 	explanation?: string;
 	createdAt: string;
@@ -466,6 +524,9 @@ export interface QuestionAnswerData {
 	correct?: boolean; // quiz only
 	correctIndices?: number[]; // quiz only (rendering)
 	committed?: string; // explain only (rendering): the model's committed answer
+	/** explain only: the committed key points, snapshotted beside
+	 *  `committed` (spec #2). Absent on records that predate them. */
+	keyPoints?: KeyPoint[];
 	explanation?: string; // quiz only (rendering)
 	dismissed?: boolean;
 	answeredAt: string;
@@ -696,6 +757,67 @@ export function toClientQuestion(qd: QuestionData): ClientQuestion {
 	};
 }
 
+/**
+ * The canonical QuestionData for a posed question call — the dock builds
+ * it once per question from the PARSED input (tool-parts). Quiz options
+ * are deterministically shuffled (seeded by toolCallId) so position never
+ * leaks correctness AND server/client render the same order
+ * (hydration-safe); the display order is snapshotted into the answer
+ * record at submit time.
+ */
+export function questionDataFor(
+	kind: QuestionKind,
+	toolCallId: string,
+	input: QuizToolInput | AskToolInput | ExplainToolInput,
+): QuestionData {
+	const quizInput = kind === "quiz" ? (input as QuizToolInput) : null;
+	const askInput = kind === "ask" ? (input as AskToolInput) : null;
+	const explainInput = kind === "explain" ? (input as ExplainToolInput) : null;
+	const multi = "multiSelect" in input ? input.multiSelect === true : false;
+	const mode: QuestionMode =
+		kind === "quiz"
+			? multi
+				? "multi-select"
+				: "single-select"
+			: askInput?.options?.length
+				? multi
+					? "multi-select"
+					: "single-select"
+				: "text";
+	const options = normalizeOptions(
+		(quizInput?.options ?? askInput?.options ?? []) as { label: string; value?: string }[],
+	);
+	const ordered = kind === "quiz" && options.length > 0 ? shuffleOptions(options, seededRandom(toolCallId)) : options;
+	const q: QuestionData = {
+		id: toolCallId,
+		kind,
+		// The role (owner 2026-10-03): predict questions gate by it in the
+		// view (never collapsed) and the answered card tucks the explanation.
+		questionType: kind === "quiz" ? normalizeQuizType((input as { type?: unknown }).type) : undefined,
+		question: input.question,
+		context: input.details,
+		mode,
+		options: ordered,
+		createdAt: new Date().toISOString(),
+	};
+	if (quizInput) {
+		const resolved = resolveCorrect(quizInput.correctAnswer, ordered);
+		if (resolved.error) console.error("[quiz] correctAnswer did not resolve:", resolved.error);
+		q.correctIndices = resolved.indices;
+		q.explanation = quizInput.explanation;
+	}
+	if (explainInput) {
+		// The commitment rides the question data (never sent to the
+		// client before answering) and snapshots into the answer at submit.
+		// One field, reasoning included — no separate explanation
+		// (owner ruling 2026-09-27) — plus its key points (spec #2; absent
+		// on records that predate them).
+		q.committedAnswer = explainInput.correctAnswer;
+		if (explainInput.keyPoints) q.keyPoints = explainInput.keyPoints;
+	}
+	return q;
+}
+
 function formatOptionRef(options: QuizOption[], index: number): string {
 	const opt = options.find((o, i) => i + 1 === index);
 	return `${index}. ${opt ? opt.label : "(unknown)"}`;
@@ -746,6 +868,7 @@ export function buildAnswer(qd: QuestionData, req: AnswerRequest, tool?: string)
 		// No client grading — the model grades in its reply, against the
 		// commitment. The commitment snapshots for the reveal + rendering.
 		base.committed = qd.committedAnswer;
+		if (qd.keyPoints) base.keyPoints = qd.keyPoints;
 	}
 	return base;
 }

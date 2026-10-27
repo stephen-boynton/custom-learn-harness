@@ -176,7 +176,7 @@ export function AnsweredCard({ answer: savedAnswer, input }: { answer: QuestionA
 					</span>
 				</div>
 			)}
-			{answer.dontKnow && isQuiz && (
+			{answer.dontKnow && (isQuiz || isExplain) && (
 				<div className="mt-2 text-sm text-muted-foreground">Answered “I don't know”.</div>
 			)}
 

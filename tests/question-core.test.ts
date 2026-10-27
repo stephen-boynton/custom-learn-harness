@@ -654,11 +654,13 @@ describe("dock selection (toggleOption / toggleOther)", () => {
 // ─── the explain tool: free-recall quizzing (owner 2026-09-27) ─────────────
 
 describe("explainInputBase / explainInputProblems (the commitment contract)", () => {
-	it("has ONE authoring field — no explanation remnant (owner ruling 2026-09-27)", () => {
+	it("has ONE committed answer — no explanation remnant — and its key points right after it", () => {
 		// The MC quiz's explanation/answer split was quiz baggage: free
-		// recall commits a single correctAnswer, reasoning included.
+		// recall commits a single correctAnswer, reasoning included (owner
+		// ruling 2026-09-27). The key points (spec #2) are distilled from
+		// it, so they follow it in authoring order (owner, 2026-10-27).
 		const keys = Object.keys(explainInputBase.properties);
-		assert.deepEqual(keys, ["question", "correctAnswer", "details"]);
+		assert.deepEqual(keys, ["question", "correctAnswer", "keyPoints", "details"]);
 	});
 
 	it("the teach object LEADS with the required pair (type, nodeId) — base fields follow", () => {
