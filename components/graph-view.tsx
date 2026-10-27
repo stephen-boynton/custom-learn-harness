@@ -1549,7 +1549,7 @@ export function GraphView({
 			{/* The full-death confirm dialog (node interlude) — portaled to
 			    body by the component itself, lives here for state locality. */}
 			<DeleteNodeDialog
-				nodes={deletingNode ? [deletingNode] : null}
+				nodes={deletingNode ? [{ ...deletingNode, evidenceCount: snapshot?.evidenceCount[deletingNode.id] ?? 0 }] : null}
 				onClose={() => setDeletingNode(null)}
 				onDeleted={(nodeIds, graphRevision) => {
 					// Close the dialog; close the detail card if it pointed here
@@ -1704,6 +1704,7 @@ export function GraphView({
 				chains={snapshot?.chains ?? []}
 				sessions={snapshot?.sessions ?? {}}
 				fileSources={snapshot?.fileSources ?? {}}
+				evidenceCount={snapshot?.evidenceCount ?? {}}
 				onClose={() => {
 					setChainsOpen(false);
 					onChainSelectClose?.();

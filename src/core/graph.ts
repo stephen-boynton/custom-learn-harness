@@ -603,6 +603,16 @@ export function graphSnapshot(deps: GraphDeps): GraphSnapshot {
 	// one-shot pass until the first merge writes the ledger.
 	const positions = deps.graphStore.readPositions();
 
+	// EVIDENCE COUNTS (#12, owner 2026-10-27): carried on the snapshot so
+	// the delete dialog shows them with NO fetch. Live propositions only —
+	// evidence on a deleted node is orphaned and counted nowhere.
+	const evidence = evidenceView(deps.graphStore.readEvidence());
+	const evidenceCount: Record<string, number> = {};
+	for (const node of graph.nodes) {
+		const n = evidence.answerCountOf(node.id);
+		if (n > 0) evidenceCount[node.id] = n;
+	}
+
 	return {
 		nodes,
 		propositions: graph.nodes,
@@ -614,6 +624,8 @@ export function graphSnapshot(deps: GraphDeps): GraphSnapshot {
 		fileSources,
 		nodeSessions,
 		clusters,
+		evidenceCount,
+		unattachedEvidence: evidence.unattached.length,
 		...(Object.keys(positions).length > 0 ? { positions } : {}),
 	};
 }
