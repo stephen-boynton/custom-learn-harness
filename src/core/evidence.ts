@@ -23,6 +23,10 @@
  *   not held      its key point absent, an extra error in the answer, or
  *                 "I don't know" (which counts against every proposition
  *                 attributed to the question).
+ * A RECOGNITION answer (#10) takes its place in that same order but can
+ * only count against: a wrong one, or "I don't know", is not held until a
+ * later production pass; a correct one says nothing. A PREDICTION never
+ * moves status, right or wrong (owner, 2026-10-27).
  * No production evidence: covered only (some chat provenance) or
  * encountered only (notes provenance alone).
  *
@@ -33,17 +37,16 @@
 import type { AnswerEntry, AttributionEntry, EvidenceEntry, GraphNode } from "./contracts.ts";
 import { hasProbeDone, type LhMessage } from "./native-messages.ts";
 import { toolQuestionKind } from "./pending.ts";
-import { normalizeQuizType, type QuestionAnswerData } from "./question-core.ts";
-import { parseExplainInput } from "./tool-parts.ts";
+import { normalizeOptions, normalizeQuizType, resolveCorrect, type QuestionAnswerData } from "./question-core.ts";
+import { parseExplainInput, parseQuizInput } from "./tool-parts.ts";
 
 /**
  * The ANSWER ENTRY for one answered question, read off the SAVED record
  * (the question call and its toolResult) — undefined when the answer is
- * not production evidence this ticket records: not a free-recall call, a
- * call with no key points (nothing was committed to grade against), or a
- * dismissal. An explain `predict` is a graded PREDICTION (owner,
- * 2026-10-27): recorded, never makes held. Phase: probe until the
- * transcript's probe_done, teach after.
+ * not evidence (see gradedKindOf) or is a dismissal. Free recall is
+ * PRODUCTION; multiple choice is RECOGNITION (#10); either with
+ * `type: "predict"` is a PREDICTION (owner, 2026-10-27): recorded, never
+ * makes held. Phase: probe until the transcript's probe_done, teach after.
  */
 export function answerEntryFor(chatId: string, messages: readonly LhMessage[], toolCallId: string, at: string): AnswerEntry | undefined {
 	const askingIndex = messages.findIndex(
@@ -53,28 +56,65 @@ export function answerEntryFor(chatId: string, messages: readonly LhMessage[], t
 	const asking = messages[askingIndex]!;
 	if (asking.role !== "assistant") return undefined;
 	const call = asking.content.find((b) => b.type === "toolCall" && b.id === toolCallId);
-	if (call?.type !== "toolCall" || toolQuestionKind(call.name) !== "explain") return undefined;
-	const input = parseExplainInput(call.arguments);
-	if (!input?.keyPoints?.length) return undefined;
+	if (call?.type !== "toolCall") return undefined;
+	const graded = gradedKindOf(call.name, call.arguments);
+	if (!graded) return undefined;
 	const result = messages.find((m) => m.role === "toolResult" && m.toolCallId === toolCallId);
 	if (result?.role !== "toolResult" || result.isError) return undefined;
 	const answer = result.details as QuestionAnswerData | undefined;
 	if (!answer || answer.dismissed) return undefined;
+	const dontKnow = answer.dontKnow === true;
 	return {
 		type: "answer",
 		toolCallId,
 		chatId,
 		questionMessageId: asking.id,
 		answerMessageId: result.id,
-		kind: normalizeQuizType(input.type) === "predict" ? "prediction" : "production",
+		kind: graded.kind,
 		phase: hasProbeDone(messages.slice(0, askingIndex)) ? "teach" : "probe",
-		dontKnow: answer.dontKnow === true,
+		dontKnow,
 		...(answer.verdict ? { verdict: answer.verdict } : {}),
+		...(graded.correctValues ? { correct: !dontKnow && choseExactly(answer, graded.correctValues) } : {}),
 		...(typeof answer.confidence === "number" ? { confidence: answer.confidence } : {}),
 		...(typeof answer.confidenceTouched === "boolean" ? { confidenceTouched: answer.confidenceTouched } : {}),
 		...((answer.thinking ?? answer.note) ? { thinking: answer.thinking ?? answer.note } : {}),
 		at,
 	};
+}
+
+/** The evidence kind of a question call, with a multiple-choice call's
+ *  committed correct option values — undefined when its answer is not
+ *  evidence: an ask, a free-recall call with no key points, or a
+ *  multiple-choice call whose correct answer does not resolve (nothing
+ *  committed to grade against). */
+function gradedKindOf(
+	toolName: string,
+	args: unknown,
+): { kind: AnswerEntry["kind"]; correctValues?: readonly string[] } | undefined {
+	const tool = toolQuestionKind(toolName);
+	if (tool === "explain") {
+		const input = parseExplainInput(args);
+		if (!input?.keyPoints?.length) return undefined;
+		return { kind: normalizeQuizType(input.type) === "predict" ? "prediction" : "production" };
+	}
+	if (tool !== "quiz") return undefined;
+	const input = parseQuizInput(args);
+	if (!input) return undefined;
+	const options = normalizeOptions(input.options);
+	const resolved = resolveCorrect(input.correctAnswer, options);
+	if (resolved.error) return undefined;
+	return {
+		kind: normalizeQuizType(input.type) === "predict" ? "prediction" : "recognition",
+		correctValues: resolved.indices.map((i) => options[i - 1]!.value),
+	};
+}
+
+/** MC correctness recomputed SERVER side (owner, 2026-10-27): the saved
+ *  selection, by option value, against the call's committed correct
+ *  answer — the client's own `correct` is never trusted. */
+function choseExactly(answer: QuestionAnswerData, correctValues: readonly string[]): boolean {
+	const chosen = new Set((Array.isArray(answer.answers) ? answer.answers : []).map((a) => a.value));
+	return chosen.size === correctValues.length && correctValues.every((v) => chosen.has(v));
 }
 
 export type HeldStatus = "held" | "misconception" | "not_held" | "covered_only" | "encountered_only";
@@ -99,8 +139,11 @@ export interface EvidenceView {
 const isNotesSourceId = (id: string): boolean => id.startsWith("src_");
 
 /** What one answer says about one proposition, or undefined when it says
- *  nothing (an uncertain verdict, a non-production answer). */
+ *  nothing (an uncertain verdict, a correct recognition answer, any
+ *  prediction). */
 function outcomeOf(answer: AnswerEntry, keyPointIds: ReadonlyArray<string | undefined>): HeldStatus | undefined {
+	// Recognition can count against held, never make it (#10).
+	if (answer.kind === "recognition") return answer.dontKnow || answer.correct === false ? "not_held" : undefined;
 	if (answer.kind !== "production") return undefined;
 	if (answer.dontKnow) return "not_held";
 	const v = answer.verdict;

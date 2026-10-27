@@ -3241,3 +3241,151 @@ describe("re-extraction: the newest run's attributions win (#11)", () => {
 		assert.equal(attributions.length, 3, "append-only: both runs' entries remain");
 	});
 });
+
+// ─── recognition and prediction answers as evidence (#10) ──────────────────
+//
+// Same seam as #9: answers through the port, the extractor attributes the
+// whole multiple-choice check (no key point), read via list_propositions.
+
+/** A multiple-choice check on heat — a teach `check` or a `predict`. */
+function heatChoiceCheck(toolCallId: string, type: "check" | "predict" = "check"): NativeCallDesc {
+	const question = "Which way does heat flow between two bodies?";
+	return {
+		name: "quiz",
+		toolCallId,
+		input: {
+			type,
+			question,
+			options: [
+				{ label: "Hot to cold", value: "hot-to-cold" },
+				{ label: "Cold to hot", value: "cold-to-hot" },
+			],
+			correctAnswer: "hot-to-cold",
+			explanation: "Heat flows down the temperature gradient.",
+		},
+		output: { kind: "quiz", questionText: question, answeredAt: "2026-10-27T01:00:00.000Z" },
+	};
+}
+
+/** One multiple-choice answer, as the chat handler writes it. */
+function choiceAnswer(chatId: string, toolCallId: string, at: string, correct: boolean, over: Partial<AnswerEntry> = {}): AnswerEntry {
+	return {
+		type: "answer",
+		toolCallId,
+		chatId,
+		questionMessageId: "a1",
+		answerMessageId: `r_${toolCallId}`,
+		kind: "recognition",
+		phase: "teach",
+		dontKnow: false,
+		correct,
+		at,
+		...over,
+	};
+}
+
+/** The heat lesson with one multiple-choice check (q1) then a free-recall check (q2). */
+function choiceThenRecallChat(title: string, type: "check" | "predict" = "check") {
+	return checksChat(title, [
+		...assistant("a1", [{ type: "text", text: "Heat flows from hot to cold by collisions until equilibrium." }, heatChoiceCheck("call-mc", type)]),
+		user("u1", "ok"),
+		...assistant("a2", [{ type: "text", text: "Now say it in your own words." }, threePointCheck("call-recall", "In your words: how does heat move?")]),
+	]);
+}
+/** q1 (the MC check) tests p1 as a whole; q2's k1 tests p1 too. */
+const CHOICE_THEN_RECALL = [
+	{ check: "q1", propositions: ["p1"] },
+	{ check: "q2", keyPoint: "k1", propositions: ["p1"] },
+];
+
+describe("recognition and prediction answers as evidence (#10)", () => {
+	it("a correct recognition or prediction answer never makes a proposition held", async () => {
+		for (const type of ["check", "predict"] as const) {
+			const { chatId } = choiceThenRecallChat(`Correct ${type} fixture`, type);
+			const ledgers = memoryLedgers();
+			ledgers.appendEvidence(
+				choiceAnswer(chatId, "call-mc", "2026-10-20T09:00:00.000Z", true, {
+					kind: type === "predict" ? "prediction" : "recognition",
+					confidence: 100,
+					confidenceTouched: true,
+				}),
+			);
+			await extractWith(chatId, ledgers, [attributingStep(HEAT_PROPOSITIONS.slice(0, 1), CHOICE_THEN_RECALL.slice(0, 1))]);
+			assert.match(await listPropositions(ledgers, chatId), /^- Heat flows hot to cold — covered only$/m, type);
+		}
+	});
+
+	it("a wrong recognition answer, or \"I don't know\" on one, counts against held", async () => {
+		for (const [label, over] of [
+			["wrong", {}],
+			["dont-know", { dontKnow: true }],
+		] as const) {
+			const { chatId } = choiceThenRecallChat(`Against-held ${label} fixture`);
+			const ledgers = memoryLedgers();
+			ledgers.appendEvidence(choiceAnswer(chatId, "call-mc", "2026-10-21T09:00:00.000Z", false, over));
+			await extractWith(chatId, ledgers, [attributingStep(HEAT_PROPOSITIONS.slice(0, 1), CHOICE_THEN_RECALL.slice(0, 1))]);
+			assert.match(await listPropositions(ledgers, chatId), /^- Heat flows hot to cold — not held \(2026-10-21\)$/m, label);
+		}
+	});
+
+	it("a later production pass makes the proposition held despite an earlier wrong recognition answer", async () => {
+		const { chatId } = choiceThenRecallChat("Pass-after-miss fixture");
+		const ledgers = memoryLedgers();
+		ledgers.appendEvidence(choiceAnswer(chatId, "call-mc", "2026-10-21T09:00:00.000Z", false));
+		ledgers.appendEvidence(productionAnswer(chatId, "call-recall", "2026-10-22T09:00:00.000Z", { k1: "present", k2: "absent", k3: "absent" }));
+		await extractWith(chatId, ledgers, [attributingStep(HEAT_PROPOSITIONS.slice(0, 1), CHOICE_THEN_RECALL)]);
+		assert.match(await listPropositions(ledgers, chatId), /^- Heat flows hot to cold — held \(2026-10-22\)$/m);
+	});
+
+	it("a wrong recognition answer after a production pass un-holds the proposition", async () => {
+		const { chatId } = choiceThenRecallChat("Miss-after-pass fixture");
+		const ledgers = memoryLedgers();
+		ledgers.appendEvidence(productionAnswer(chatId, "call-recall", "2026-10-21T09:00:00.000Z", { k1: "present", k2: "absent", k3: "absent" }));
+		ledgers.appendEvidence(choiceAnswer(chatId, "call-mc", "2026-10-23T09:00:00.000Z", false));
+		await extractWith(chatId, ledgers, [attributingStep(HEAT_PROPOSITIONS.slice(0, 1), CHOICE_THEN_RECALL)]);
+		assert.match(await listPropositions(ledgers, chatId), /^- Heat flows hot to cold — not held \(2026-10-23\)$/m);
+	});
+
+	it("a wrong prediction, or \"I don't know\" on one, is neutral: recorded, never moves status", async () => {
+		for (const [label, over] of [
+			["wrong", {}],
+			["dont-know", { dontKnow: true }],
+		] as const) {
+			const { chatId } = choiceThenRecallChat(`Neutral prediction ${label} fixture`, "predict");
+			const ledgers = memoryLedgers();
+			ledgers.appendEvidence(productionAnswer(chatId, "call-recall", "2026-10-21T09:00:00.000Z", { k1: "present", k2: "absent", k3: "absent" }));
+			ledgers.appendEvidence(choiceAnswer(chatId, "call-mc", "2026-10-23T09:00:00.000Z", false, { kind: "prediction", ...over }));
+			await extractWith(chatId, ledgers, [attributingStep(HEAT_PROPOSITIONS.slice(0, 1), CHOICE_THEN_RECALL)]);
+			assert.match(await listPropositions(ledgers, chatId), /^- Heat flows hot to cold — held \(2026-10-21\)$/m, label);
+		}
+	});
+
+	it("unattributed recognition and prediction checks become unattached entries", async () => {
+		const { chatId } = checksChat("Unattached choice fixture", [
+			...assistant("a1", [
+				{ type: "text", text: "Heat flows from hot to cold by collisions until equilibrium." },
+				heatChoiceCheck("call-recognise"),
+				heatChoiceCheck("call-predict", "predict"),
+			]),
+		]);
+		const ledgers = memoryLedgers();
+		ledgers.appendEvidence(choiceAnswer(chatId, "call-recognise", "2026-10-21T09:00:00.000Z", false));
+		ledgers.appendEvidence(choiceAnswer(chatId, "call-predict", "2026-10-21T09:01:00.000Z", false, { kind: "prediction" }));
+		await extractWith(chatId, ledgers, [attributingStep(HEAT_PROPOSITIONS.slice(0, 1), [])]);
+
+		assert.match(await listPropositions(ledgers, chatId), /^- Heat flows hot to cold — covered only$/m);
+		assert.deepEqual(evidenceView(ledgers.readEvidence()).unattached.map((a) => a.toolCallId), ["call-recognise", "call-predict"]);
+	});
+
+	it("a multiple-choice check is attributed as a whole and the merger writes its attribution entry", async () => {
+		const { chatId } = choiceThenRecallChat("Choice attribution fixture");
+		const ledgers = memoryLedgers();
+		await extractWith(chatId, ledgers, [attributingStep(HEAT_PROPOSITIONS.slice(0, 2), [{ check: "q1", propositions: ["p1", "p2"] }])]);
+		const attributions = ledgers.readEvidence().filter((e) => e.type === "attribution");
+		assert.equal(attributions.length, 2);
+		for (const a of attributions) {
+			assert.equal(a.toolCallId, "call-mc");
+			assert.equal(a.keyPointId, undefined, "the whole check — no key point");
+		}
+	});
+});
