@@ -2732,6 +2732,24 @@ describe("checks in the extraction view (ADR-0004, #8)", () => {
 		assert.doesNotMatch(view!, /ASK-SECRET/);
 	});
 
+	it("an old explain or recall with no key points is left out of the view", async () => {
+		const old = (toolCallId: string, name: "explain" | "recall"): NativeCallDesc => {
+			const check = explainCheck(toolCallId);
+			const { keyPoints: _none, ...input } = check.input as Record<string, unknown>;
+			void _none;
+			return { ...check, name, input: { ...input, question: `OLD-${name}?` } };
+		};
+		const { chatId } = checksChat("Old records fixture", [
+			...assistant("a1", [{ type: "text", text: "From before key points existed." }, old("call-old-ex", "explain"), old("call-old-rc", "recall")]),
+			user("u1", "ok"),
+			...assistant("a2", [{ type: "text", text: "A current one." }, explainCheck("call-new")]),
+		]);
+		const [view] = (await extractViews(chatId)).views;
+		assert.doesNotMatch(view!, /OLD-/);
+		assert.equal((view!.match(/^CHECK /gm) ?? []).length, 1);
+		assert.match(view!, /^CHECK q1 \[a2\] — free recall$/m);
+	});
+
 	it("check lines count toward the fill budget, never toward coverage tokens", async () => {
 		const bigCheck = mcCheck("call-big", { question: `Which of these? ${"clause ".repeat(400)}` });
 		const prose = (n: number) => ({ type: "text", text: `topic ${n}: ${"detail ".repeat(700)}${n}` });

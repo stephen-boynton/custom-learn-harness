@@ -67,7 +67,8 @@ function refusedCallIds(messages: ReadonlyArray<LhMessage>): Set<string> {
 }
 
 /** The check block of one tool call, or undefined when it is not a posed
- *  graded check (ask_user_question, other tools, unparseable input). */
+ *  graded check (ask_user_question, other tools, unparseable input, an
+ *  old explain/recall with no key points). */
 function posedCheckOf(block: { id: string; name: string; arguments: unknown }, messageId: string): PosedCheck | undefined {
 	if (RECOGNITION_TOOLS.has(block.name)) {
 		const input = parseQuizInput(block.arguments);
@@ -85,15 +86,17 @@ function posedCheckOf(block: { id: string; name: string; arguments: unknown }, m
 	}
 	if (PRODUCTION_TOOLS.has(block.name)) {
 		const input = parseExplainInput(block.arguments);
-		if (!input) return undefined;
-		const keyPoints = input.keyPoints ?? [];
+		// A call from before key points existed is not a graded check: it
+		// is left out (owner, code review).
+		const keyPoints = input?.keyPoints ?? [];
+		if (!input || keyPoints.length === 0) return undefined;
 		const role = normalizeQuizType(input.type) === "predict" ? "free recall, prediction" : "free recall";
 		// Key points show prefixed by their check's alias ("q1.p1") so they
 		// can't pass for proposition ids (owner, after #9) — display only:
 		// the wire still names them { check: "q1", keyPoint: "p1" }.
 		const render = (alias: string): string => {
 			const lines = [`CHECK ${alias} [${messageId}] — ${role}`, `Question: ${input.question.trim()}`];
-			if (keyPoints.length > 0) lines.push("Key points:", ...keyPoints.map((p) => `  ${alias}.${p.id}: ${p.text.trim()}`));
+			lines.push("Key points:", ...keyPoints.map((p) => `  ${alias}.${p.id}: ${p.text.trim()}`));
 			return lines.join("\n");
 		};
 		return { toolCallId: block.id, messageId, keyPointIds: keyPoints.map((p) => p.id), render };
