@@ -941,7 +941,10 @@ export function compactAnswerForModel(ad: QuestionAnswerData): Record<string, un
 		const verdict = verdictForModel(ad);
 		if (verdict) out.verdict = verdict;
 	}
-	if (ad.confidence !== undefined) out.confidence = ad.confidence;
+	// Confidence only when he moved the slider (owner, code review): an
+	// untouched resting value is "not given", never read as a real 50. A
+	// record from before the flag existed keeps its number.
+	if (ad.confidence !== undefined) out.confidence = ad.confidenceTouched === false ? "not given" : ad.confidence;
 	// Two DISTINCT thinking channels, clearly keyed so the model never
 	// conflates them (owner 2026-10-03): reasoning on the question vs
 	// thinking while reading the teaching. `note` is the pre-rename key —

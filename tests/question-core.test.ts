@@ -535,6 +535,19 @@ describe("compactAnswerForModel", () => {
 		assert.ok(!("questionId" in compact), "questionId was the toolCallId restated");
 	});
 
+	it("confidence shows only when the learner moved the slider — an untouched one reads \"not given\"", () => {
+		const touched = buildAnswer(quizData(), { values: ["mercury"], confidence: 70, confidenceTouched: true });
+		assert.equal(compactAnswerForModel(touched).confidence, 70);
+		const untouched = buildAnswer(quizData(), { values: ["mercury"], confidence: 50, confidenceTouched: false });
+		assert.equal(compactAnswerForModel(untouched).confidence, "not given");
+		const explainQD: QuestionData = { id: "e1", kind: "explain", question: "Why?", mode: "text", options: [], createdAt: new Date().toISOString() };
+		const explainUntouched = buildAnswer(explainQD, { text: "It is near the Sun.", confidence: 50, confidenceTouched: false }, "explain");
+		assert.equal(compactAnswerForModel(explainUntouched).confidence, "not given");
+		// A record from before the flag existed: its confidence was always a real pick.
+		const legacy = buildAnswer(quizData(), { values: ["mercury"], confidence: 50 });
+		assert.equal(compactAnswerForModel(legacy).confidence, 50);
+	});
+
 	it("dontKnow: the gap flag stands alone — no verdict, no confidence", () => {
 		const compact = compactAnswerForModel(buildAnswer(quizData(), { dontKnow: true }));
 		assert.deepEqual(compact, { kind: "quiz", dontKnow: true });
