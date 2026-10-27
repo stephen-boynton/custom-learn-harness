@@ -19,6 +19,7 @@
 
 import { Type, type Static } from "typebox";
 import { stripModelValueDebris } from "./value-debris.ts";
+import { verdictForModel, type Verdict } from "./verdict.ts";
 
 // ─── shared types ───────────────────────────────────────────────────────────
 
@@ -534,6 +535,11 @@ export interface QuestionAnswerData {
 	/** explain only: the committed key points, snapshotted beside
 	 *  `committed` (spec #2). Absent on records that predate them. */
 	keyPoints?: KeyPoint[];
+	/** explain only: the independent grader's verdict (spec #2, ADR-0003),
+	 *  set SERVER side before the answer is saved — written once, never
+	 *  revised. Absent on "I don't know" (never graded) and on records
+	 *  that predate grading. */
+	verdict?: Verdict;
 	explanation?: string; // quiz only (rendering)
 	dismissed?: boolean;
 	answeredAt: string;
@@ -928,6 +934,13 @@ export function compactAnswerForModel(ad: QuestionAnswerData): Record<string, un
 	// information the model needs for its next move. (dontKnow implies
 	// incorrect and carries no confidence: both stay implicit.)
 	if (ad.correct !== undefined && !ad.dontKnow) out.correct = ad.correct;
+	// Free recall: the grader's verdict as the teacher reads it — the
+	// display label and per-point statuses (spec #2), so it can repair
+	// what was missed. The stored verdict itself never changes.
+	if (ad.kind === "explain") {
+		const verdict = verdictForModel(ad);
+		if (verdict) out.verdict = verdict;
+	}
 	if (ad.confidence !== undefined) out.confidence = ad.confidence;
 	// Two DISTINCT thinking channels, clearly keyed so the model never
 	// conflates them (owner 2026-10-03): reasoning on the question vs
