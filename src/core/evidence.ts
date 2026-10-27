@@ -41,14 +41,13 @@
 
 import { isNotesSourceId, type AnswerEntry, type AttributionEntry, type EvidenceEntry, type GraphNode } from "./contracts.ts";
 import { hasProbeDone, type LhMessage } from "./native-messages.ts";
-import { toolQuestionKind } from "./pending.ts";
-import { normalizeOptions, normalizeQuizType, resolveCorrect, type QuestionAnswerData } from "./question-core.ts";
-import { parseExplainInput, parseQuizInput } from "./tool-parts.ts";
+import { gradedCheckOf } from "./graded-check.ts";
+import type { QuestionAnswerData } from "./question-core.ts";
 
 /**
  * The ANSWER ENTRY for one answered question, read off the SAVED record
  * (the question call and its toolResult) — undefined when the answer is
- * not evidence (see gradedKindOf) or is a dismissal. Free recall is
+ * not evidence (core/graded-check.ts) or is a dismissal. Free recall is
  * PRODUCTION; multiple choice is RECOGNITION (#10); either with
  * `type: "predict"` is a PREDICTION (owner, 2026-10-27): recorded, never
  * makes held. Phase: probe until the transcript's probe_done, teach after.
@@ -62,8 +61,10 @@ export function answerEntryFor(chatId: string, messages: readonly LhMessage[], t
 	if (asking.role !== "assistant") return undefined;
 	const call = asking.content.find((b) => b.type === "toolCall" && b.id === toolCallId);
 	if (call?.type !== "toolCall") return undefined;
-	const graded = gradedKindOf(call.name, call.arguments);
+	const graded = gradedCheckOf(call.name, call.arguments);
 	if (!graded) return undefined;
+	const correctValues =
+		graded.mechanic === "multiple_choice" ? graded.correctIndices.map((i) => graded.options[i - 1]!.value) : undefined;
 	const result = messages.find((m) => m.role === "toolResult" && m.toolCallId === toolCallId);
 	if (result?.role !== "toolResult" || result.isError) return undefined;
 	const answer = result.details as QuestionAnswerData | undefined;
@@ -79,38 +80,11 @@ export function answerEntryFor(chatId: string, messages: readonly LhMessage[], t
 		phase: hasProbeDone(messages.slice(0, askingIndex)) ? "teach" : "probe",
 		dontKnow,
 		...(answer.verdict ? { verdict: answer.verdict } : {}),
-		...(graded.correctValues ? { correct: !dontKnow && choseExactly(answer, graded.correctValues) } : {}),
+		...(correctValues ? { correct: !dontKnow && choseExactly(answer, correctValues) } : {}),
 		...(typeof answer.confidence === "number" ? { confidence: answer.confidence } : {}),
 		...(typeof answer.confidenceTouched === "boolean" ? { confidenceTouched: answer.confidenceTouched } : {}),
 		...((answer.thinking ?? answer.note) ? { thinking: answer.thinking ?? answer.note } : {}),
 		at,
-	};
-}
-
-/** The evidence kind of a question call, with a multiple-choice call's
- *  committed correct option values — undefined when its answer is not
- *  evidence: an ask, a free-recall call with no key points, or a
- *  multiple-choice call whose correct answer does not resolve (nothing
- *  committed to grade against). */
-function gradedKindOf(
-	toolName: string,
-	args: unknown,
-): { kind: AnswerEntry["kind"]; correctValues?: readonly string[] } | undefined {
-	const tool = toolQuestionKind(toolName);
-	if (tool === "explain") {
-		const input = parseExplainInput(args);
-		if (!input?.keyPoints?.length) return undefined;
-		return { kind: normalizeQuizType(input.type) === "predict" ? "prediction" : "production" };
-	}
-	if (tool !== "quiz") return undefined;
-	const input = parseQuizInput(args);
-	if (!input) return undefined;
-	const options = normalizeOptions(input.options);
-	const resolved = resolveCorrect(input.correctAnswer, options);
-	if (resolved.error) return undefined;
-	return {
-		kind: normalizeQuizType(input.type) === "predict" ? "prediction" : "recognition",
-		correctValues: resolved.indices.map((i) => options[i - 1]!.value),
 	};
 }
 

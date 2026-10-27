@@ -32,8 +32,7 @@ import type { LhMessage } from "./native-messages.ts";
 import { failedOutputCallIds, userFacingTextOf } from "./native-messages.ts";
 import type { CoverageSlot } from "./coverage.ts";
 import { viewTokens } from "./coverage.ts";
-import { normalizeOptions, normalizeQuizType, resolveCorrect } from "./question-core.ts";
-import { parseExplainInput, parseQuizInput } from "./tool-parts.ts";
+import { gradedCheckOf } from "./graded-check.ts";
 
 /** One posed check, rendered except for its batch-local alias. */
 export interface PosedCheck {
@@ -54,9 +53,6 @@ export interface ViewCheck {
 	keyPointIds: string[];
 }
 
-const RECOGNITION_TOOLS = new Set(["quiz", "probe"]);
-const PRODUCTION_TOOLS = new Set(["explain", "recall"]);
-
 /** Question calls the boundary REFUSED (an isError result) — never posed. */
 function refusedCallIds(messages: ReadonlyArray<LhMessage>): Set<string> {
 	const out = new Set<string>();
@@ -67,41 +63,34 @@ function refusedCallIds(messages: ReadonlyArray<LhMessage>): Set<string> {
 }
 
 /** The check block of one tool call, or undefined when it is not a posed
- *  graded check (ask_user_question, other tools, unparseable input, an
- *  old explain/recall with no key points). */
+ *  graded check (core/graded-check.ts: ask_user_question, other tools,
+ *  unparseable input, an old explain/recall with no key points — left out,
+ *  owner code review — or a multiple choice whose correct answer does not
+ *  resolve). */
 function posedCheckOf(block: { id: string; name: string; arguments: unknown }, messageId: string): PosedCheck | undefined {
-	if (RECOGNITION_TOOLS.has(block.name)) {
-		const input = parseQuizInput(block.arguments);
-		if (!input) return undefined;
-		const options = normalizeOptions(input.options);
-		const correct = resolveCorrect(input.correctAnswer, options).indices.map((i) => options[i - 1]!.label);
-		const role = normalizeQuizType(input.type) === "predict" ? "multiple choice, prediction" : "multiple choice";
+	const check = gradedCheckOf(block.name, block.arguments);
+	if (!check) return undefined;
+	const prediction = check.kind === "prediction" ? ", prediction" : "";
+	if (check.mechanic === "multiple_choice") {
 		const body = [
-			`Question: ${input.question.trim()}`,
+			`Question: ${check.question.trim()}`,
 			"Options:",
-			...options.map((o) => `  - ${o.label}`),
-			`Correct answer: ${correct.join("; ")}`,
+			...check.options.map((o) => `  - ${o.label}`),
+			`Correct answer: ${check.correctIndices.map((i) => check.options[i - 1]!.label).join("; ")}`,
 		];
-		return { toolCallId: block.id, messageId, keyPointIds: [], render: (alias) => [`CHECK ${alias} [${messageId}] — ${role}`, ...body].join("\n") };
+		return { toolCallId: block.id, messageId, keyPointIds: [], render: (alias) => [`CHECK ${alias} [${messageId}] — multiple choice${prediction}`, ...body].join("\n") };
 	}
-	if (PRODUCTION_TOOLS.has(block.name)) {
-		const input = parseExplainInput(block.arguments);
-		// A call from before key points existed is not a graded check: it
-		// is left out (owner, code review).
-		const keyPoints = input?.keyPoints ?? [];
-		if (!input || keyPoints.length === 0) return undefined;
-		const role = normalizeQuizType(input.type) === "predict" ? "free recall, prediction" : "free recall";
-		// Key points show prefixed by their check's alias ("q1.p1") so they
-		// can't pass for proposition ids (owner, after #9) — display only:
-		// the wire still names them { check: "q1", keyPoint: "p1" }.
-		const render = (alias: string): string => {
-			const lines = [`CHECK ${alias} [${messageId}] — ${role}`, `Question: ${input.question.trim()}`];
-			lines.push("Key points:", ...keyPoints.map((p) => `  ${alias}.${p.id}: ${p.text.trim()}`));
-			return lines.join("\n");
-		};
-		return { toolCallId: block.id, messageId, keyPointIds: keyPoints.map((p) => p.id), render };
-	}
-	return undefined;
+	// Key points show prefixed by their check's alias ("q1.p1") so they
+	// can't pass for proposition ids (owner, after #9) — display only: the
+	// wire still names them { check: "q1", keyPoint: "p1" }.
+	const render = (alias: string): string =>
+		[
+			`CHECK ${alias} [${messageId}] — free recall${prediction}`,
+			`Question: ${check.question.trim()}`,
+			"Key points:",
+			...check.keyPoints.map((p) => `  ${alias}.${p.id}: ${p.text.trim()}`),
+		].join("\n");
+	return { toolCallId: block.id, messageId, keyPointIds: check.keyPoints.map((p) => p.id), render };
 }
 
 /** The posed checks of ONE message, in content order. */

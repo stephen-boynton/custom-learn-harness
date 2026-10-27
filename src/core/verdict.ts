@@ -72,12 +72,18 @@ export interface GradedAnswer {
 	keyPoints?: readonly Pick<KeyPoint, "id" | "required">[];
 }
 
+/** Does the verdict show an error — a contradicted key point or an
+ *  extra error? Fails pass; labels the answer a misconception. */
+function showsError(v: Verdict): boolean {
+	return v.points.some((point) => point.status === "contradicted") || v.extraErrors.length > 0;
+}
+
 /** PASS (spec #2): attempt answered, not "I don't know", not uncertain,
  *  every required point present, no point contradicted, no extra errors. */
 export function answerPasses(answer: GradedAnswer): boolean {
 	const v = answer.verdict;
 	if (answer.dontKnow || !v || v.uncertain || v.attempt !== "answered") return false;
-	if (v.points.some((point) => point.status === "contradicted") || v.extraErrors.length > 0) return false;
+	if (showsError(v)) return false;
 	const status = new Map(v.points.map((point) => [point.id, point.status]));
 	return (answer.keyPoints ?? []).every((point) => !point.required || status.get(point.id) === "present");
 }
@@ -97,7 +103,7 @@ export function displayLabel(answer: GradedAnswer): DisplayLabel | undefined {
 	if (!v) return undefined;
 	if (v.uncertain) return "ungraded";
 	if (v.attempt === "off_target") return "off_target";
-	if (v.points.some((point) => point.status === "contradicted") || v.extraErrors.length > 0) return "misconception";
+	if (showsError(v)) return "misconception";
 	return answerPasses(answer) ? "correct" : "incomplete";
 }
 
