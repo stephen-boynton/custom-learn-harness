@@ -20,9 +20,10 @@
  *   held          its key point present, and no contradiction or extra
  *                 error touching it;
  *   misconception its key point contradicted;
- *   not held      its key point absent, an extra error in the answer, or
- *                 "I don't know" (which counts against every proposition
- *                 attributed to the question).
+ *   not held      its key point absent, an extra error in the answer, an
+ *                 off-target answer, or "I don't know" (the last three
+ *                 count against every proposition attributed to the
+ *                 question).
  * A RECOGNITION answer (#10) takes its place in that same order but can
  * only count against: a wrong one, or "I don't know", is not held until a
  * later production pass; a correct one says nothing. A PREDICTION never
@@ -154,6 +155,9 @@ function outcomeOf(answer: AnswerEntry, keyPointIds: ReadonlyArray<string | unde
 	if (answer.dontKnow) return "not_held";
 	const v = answer.verdict;
 	if (!v || v.uncertain) return undefined;
+	// Off target fails pass (verdict.ts answerPasses) — not held for every
+	// idea the answer was attributed to (owner, code review).
+	if (v.attempt === "off_target") return "not_held";
 	const status = new Map(v.points.map((p) => [p.id, p.status]));
 	// One proposition may be tested by more than one key point of the
 	// same answer: it is held only when every one of them is present.

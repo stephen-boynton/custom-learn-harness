@@ -2979,6 +2979,22 @@ describe("held status from production evidence (#9)", () => {
 		assert.match(out, /^- Thermal equilibrium — covered only$/m, "an unattributed proposition is untouched");
 	});
 
+	it("an off-target answer counts as not held for every proposition its key points were attributed to — as it fails pass", async () => {
+		const { chatId } = checksChat("Off-target fixture", [
+			...assistant("a1", [{ type: "text", text: "Heat flows from hot to cold by collisions until equilibrium." }, threePointCheck("call-heat")]),
+		]);
+		const ledgers = memoryLedgers();
+		const answer = productionAnswer(chatId, "call-heat", "2026-10-21T09:00:00.000Z", { k1: "present", k2: "contradicted", k3: "absent" });
+		answer.verdict!.attempt = "off_target";
+		ledgers.appendEvidence(answer);
+		await extractWith(chatId, ledgers, [attributingStep(HEAT_PROPOSITIONS, PER_POINT)]);
+
+		const out = await listPropositions(ledgers, chatId);
+		for (const name of ["Heat flows hot to cold", "Collisions carry heat", "Thermal equilibrium"]) {
+			assert.match(out, new RegExp(`^- ${name} — not held \\(2026-10-21\\)$`, "m"));
+		}
+	});
+
 	it("probe evidence makes a proposition held though it was never taught", async () => {
 		// A probe-phase recall: the prober's own message, no teaching yet.
 		const { chatId } = checksChat("Probe-evidence fixture", [
