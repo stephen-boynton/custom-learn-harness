@@ -58,6 +58,7 @@ import {
 	type TurnInput,
 } from "../core/input-events.ts";
 import { steerDelivered } from "../core/contracts.ts";
+import { withVerdict, type GraderSpend } from "./grading.ts";
 import type {CallUsage} from "../core/contracts.ts";
 
 /**
@@ -270,10 +271,11 @@ export async function handleChatInput(
 	// input is the only steer appender; in-run delivery rides pi's own
 	// follow-up queue and never builds an input event at all.
 	let appends;
+	const recordMessages = record.messages;
 	try {
 		appends =
 			input.type === "steers"
-				? input.steers.filter((s) => !steerDelivered(record.messages, s.id))
+				? input.steers.filter((s) => !steerDelivered(recordMessages, s.id))
 				: inputAppends(record, input);
 	} catch (err) {
 		if (err instanceof ChatInputError) {
@@ -292,24 +294,77 @@ export async function handleChatInput(
 	// the sibling question permanently pre-fix). Nothing else can generate
 	// while a question dangles (job wakes wait, continuation folds refuse,
 	// the composer gates), so adjacency holds by construction.
+	//
+	// One turn per chat, ever. A second request while a turn runs means a
+	// stale/remounted client raced a live one — letting it through would
+	// double-run the teacher and clobber the first turn's persist.
+	const turnInFlight = () => {
+		console.info(`[chat ${chatId}] turn already in flight — request rejected`);
+		return Response.json({ error: "A turn is already running for this session" }, { status: 409 });
+	};
+	let turnBegun = false;
+	// THE GRADER (spec #2, owner 2026-10-27): a production answer is graded
+	// AFTER the one-turn guard and BEFORE it is saved — the answer and its
+	// verdict land in one write, never rewritten. A deferred sibling answer
+	// (no turn) is graded the same way. The record is re-read after grading
+	// and the appends recomputed: the answer must still target the pending
+	// question, and the save must not clobber anything that landed meanwhile.
+	let graderSpend: GraderSpend | undefined;
+	if (input.type === "answer") {
+		if (danglingQuestionOf([...record.messages, ...appends]) === null) {
+			if (!beginTurn(chatId)) return turnInFlight();
+			turnBegun = true;
+		}
+		const graded = await withVerdict(chatId, record.messages, input.toolCallId, input.answer);
+		graderSpend = graded.spend;
+		input = { ...input, answer: graded.answer };
+		const fresh = stores.chatStore.getChat(chatId);
+		try {
+			if (!fresh) throw new ChatInputError("Unknown chat");
+			record = fresh;
+			appends = inputAppends(record, input);
+		} catch (err) {
+			if (turnBegun) endTurn(chatId);
+			if (err instanceof ChatInputError) {
+				return Response.json({ error: err.message }, { status: fresh ? 400 : 404 });
+			}
+			throw err;
+		}
+	}
+	/** The grader's spend joins the chat's turn-usage log, keyed to the
+	 *  answer it graded (its own entry: the grader's model differs from the
+	 *  turn's). */
+	const recordGraderSpend = () => {
+		const answerResult = appends[0];
+		if (!graderSpend || !answerResult) return;
+		try {
+			stores.chatStore.appendTurnUsage(chatId, {
+				id: crypto.randomUUID(),
+				messageId: answerResult.id,
+				at: new Date().toISOString(),
+				model: graderSpend.model,
+				steps: graderSpend.steps,
+			});
+		} catch (err) {
+			console.error(`[chat ${chatId}] grader usage append failed:`, err);
+		}
+	};
+
 	if (input.type === "answer" && danglingQuestionOf([...record.messages, ...appends]) !== null) {
 		const merged = [...record.messages, ...appends];
 		try { stores.chatStore.saveMessages(chatId, merged); }
 		catch (err) {
 			console.error(`[chat ${chatId}] write-ahead persist failed:`, err);
+			if (turnBegun) endTurn(chatId);
 			return new Response("Your input could not be saved. Please try again.", { status: 500 });
 		}
+		recordGraderSpend();
+		if (turnBegun) endTurn(chatId);
 		emit("record-changed", { chatId });
 		return settledTurnResponse(); // the cheap terminal — no beginTurn, no turn
 	}
 
-	// One turn per chat, ever. A second request while a turn runs means a
-	// stale/remounted client raced a live one — letting it through would
-	// double-run the teacher and clobber the first turn's persist.
-	if (!beginTurn(chatId)) {
-		console.info(`[chat ${chatId}] turn already in flight — request rejected`);
-		return Response.json({ error: "A turn is already running for this session" }, { status: 409 });
-	}
+	if (!turnBegun && !beginTurn(chatId)) return turnInFlight();
 
 	// Write-ahead persistence: the input's native appends go on disk BEFORE
 	// the turn starts - the learner's answer is durable the instant the
@@ -327,6 +382,7 @@ export async function handleChatInput(
 		endTurn(chatId);
 		return new Response("Your input could not be saved. Please try again.", { status: 500 });
 	}
+	recordGraderSpend();
 	// Visibility bookkeeping is not the canonical save. Its failure must
 	// neither misreport a saved input as lost nor prevent the turn running.
 	try {
