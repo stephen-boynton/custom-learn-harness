@@ -83,6 +83,15 @@ export interface ProvenancePoint {
 	messageId: string;
 }
 
+/** The prefix of every notes source id — the notes front door mints its
+ *  ids with it, and readers tell a notes source from a chat by it. */
+export const NOTES_SOURCE_ID_PREFIX = "src_";
+
+/** Is this provenance key a notes source (not a chat)? */
+export function isNotesSourceId(id: string): boolean {
+	return id.startsWith(NOTES_SOURCE_ID_PREFIX);
+}
+
 /** One imported notes file — the format-agnostic front door's bookkeeping
  *  (DECIDED 2026-09-13): personal notes in ARBITRARY formats run through the
  *  same extractor → auditor → merger pipeline, with the file itself as the
@@ -92,6 +101,8 @@ export interface ProvenancePoint {
  *  path — deterministic, so re-importing the same file re-runs extraction
  *  against the same source id (mappings dedupe by it). */
 export interface NotesSource {
+	/** NOTES_SOURCE_ID_PREFIX + the path hash (the notes front door,
+	 *  agent/subagents/extraction.ts importNotes, mints it). */
 	id: string;
 	filePath: string;
 	/** ISO — when this file was imported (the checkpoint's foldedAt). */

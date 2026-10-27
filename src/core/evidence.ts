@@ -39,7 +39,7 @@
  * re-extraction that attributes nothing leaves the check unattached.
  */
 
-import type { AnswerEntry, AttributionEntry, EvidenceEntry, GraphNode } from "./contracts.ts";
+import { isNotesSourceId, type AnswerEntry, type AttributionEntry, type EvidenceEntry, type GraphNode } from "./contracts.ts";
 import { hasProbeDone, type LhMessage } from "./native-messages.ts";
 import { toolQuestionKind } from "./pending.ts";
 import { normalizeOptions, normalizeQuizType, resolveCorrect, type QuestionAnswerData } from "./question-core.ts";
@@ -144,10 +144,6 @@ export interface EvidenceView {
 	 *  only about live nodes. */
 	answerCountOf(nodeId: string): number;
 }
-
-/** Imported-notes source ids are "src_" + a path hash (the notes front
- *  door, agent/subagents/extraction.ts) — everything else is a chat. */
-const isNotesSourceId = (id: string): boolean => id.startsWith("src_");
 
 /** What one answer says about one proposition: a status, "recovered" (a
  *  correct recognition answer — it can clear an earlier wrong one, never
