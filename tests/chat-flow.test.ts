@@ -1861,6 +1861,42 @@ describe("explain and recall commit key points — ungradeable commitments are r
 	});
 });
 
+describe("old explain/recall records without key points still load", () => {
+	it("the golden teach chat (recall ×1, explain ×2, no key points) loads, its record reads back, and a new turn runs over it", async () => {
+		const golden = JSON.parse(
+			fs.readFileSync(path.join(import.meta.dirname, "fixtures", "golden-data", "chats", "chat_mv27rrra_feff23b6.json"), "utf-8"),
+		) as { messages: LhMessage[] };
+		const oldCalls = golden.messages.flatMap((m) =>
+			m.role === "assistant" ? m.content.filter((b) => b.type === "toolCall" && (b.name === "explain" || b.name === "recall")) : [],
+		);
+		assert.equal(oldCalls.length, 3, "the fixture still holds the three old free-recall calls");
+		assert.ok(oldCalls.every((b) => b.type === "toolCall" && !("keyPoints" in b.arguments)), "none has key points");
+
+		const chat = createConfiguredChat("Test: old free-recall records");
+		createdChats.push(chat.id);
+		chatStore.saveMessages(chat.id, golden.messages);
+		const before = evidenceLines.length;
+
+		const res = await recordRoute.GET(new Request("http://test/record"), { params: Promise.resolve({ id: chat.id }) });
+		assert.equal(res.status, 200);
+		const snapshot = (await res.json()) as { messages: LhMessage[] };
+		assert.equal(snapshot.messages.length, golden.messages.length);
+		assert.doesNotThrow(() => projectView(snapshot.messages));
+
+		const { engine, calls } = scriptedTeacher((cs) => [
+			(context) => {
+				cs.push(context.messages.map((m) => JSON.stringify((m as { content: unknown }).content)));
+				return fauxAssistantMessage([fauxText("Picking up where we left off.")]);
+			},
+		]);
+		const body = await drainTurn(post(chat.id, { type: "text", text: "Let's continue." }), agentFactory(engine));
+		assert.deepEqual(eventsOf(body).filter((e) => e.type === "error"), []);
+		assert.equal(calls.length, 1, "the teacher ran over the old history");
+		assert.ok(calls[0]!.join(" ").includes("It is updated with the Bayes theorem"), "the old recall answer is in its context");
+		assert.equal(evidenceLines.length, before, "loading old records writes no evidence");
+	});
+});
+
 // ─── the independent grader (#7, ADR-0003) ─────────────────────────────────
 
 describe("the independent grader puts a verdict on each production answer", () => {
