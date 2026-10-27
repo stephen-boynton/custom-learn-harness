@@ -1849,7 +1849,7 @@ describe("explain and recall commit key points — ungradeable commitments are r
 
 		// The dock's own path: the question data built from the posed call,
 		// then the learner's answer.
-		const qd = questionDataFor("explain", pending!.toolCallId, parseExplainInput(pending!.input)!);
+		const qd = questionDataFor("explain", pending!.toolCallId, parseExplainInput(pending!.input)!, { now: new Date().toISOString() });
 		const answer = buildAnswer(qd, { text: "It is always near the Sun." }, "explain");
 		await drainTurn(post(chat.id, { type: "answer", toolCallId: "call-kp", answer }), factory);
 
@@ -1968,7 +1968,7 @@ describe("the independent grader puts a verdict on each production answer", () =
 			createTeacherAgent(undefined, { engine, messages: opts.messages, tools });
 		await drainTurn(post(chat.id, { type: "text", text: "LEARNER-OPENING-LINE" }), factory);
 		const pending = danglingQuestionOf(chatStore.getChat(chat.id)!.messages)!;
-		const qd = questionDataFor("explain", pending.toolCallId, parseExplainInput(pending.input)!);
+		const qd = questionDataFor("explain", pending.toolCallId, parseExplainInput(pending.input)!, { now: new Date().toISOString() });
 		const answer = buildAnswer(qd, answerReq, "explain");
 		graderModelOverride.current = grader;
 		try {
@@ -2227,7 +2227,7 @@ describe("the independent grader puts a verdict on each production answer", () =
 		const factory: Parameters<typeof handleChatRequest>[1] = (opts) => createTeacherAgent(undefined, { engine, messages: opts.messages, tools });
 		await drainTurn(post(chat.id, { type: "text", text: "go" }), factory);
 		const pending = danglingQuestionOf(chatStore.getChat(chat.id)!.messages)!;
-		const qd = questionDataFor("explain", pending.toolCallId, parseExplainInput(pending.input)!);
+		const qd = questionDataFor("explain", pending.toolCallId, parseExplainInput(pending.input)!, { now: new Date().toISOString() });
 		graderModelOverride.current = grader.engine;
 		try {
 			const dontKnow = { ...buildAnswer(qd, { dontKnow: true }, "explain"), verdict: forged };
@@ -2259,7 +2259,7 @@ describe("the independent grader puts a verdict on each production answer", () =
 		await drainTurn(post(chat.id, { type: "text", text: "two at once" }), factory);
 		const pending = danglingQuestionOf(chatStore.getChat(chat.id)!.messages)!;
 		assert.equal(pending.toolCallId, "call-g");
-		const qd = questionDataFor("explain", pending.toolCallId, parseExplainInput(pending.input)!);
+		const qd = questionDataFor("explain", pending.toolCallId, parseExplainInput(pending.input)!, { now: new Date().toISOString() });
 		const grader = scriptedGrader([verdictCall(["present", "contradicted", "absent"])]);
 		graderModelOverride.current = grader.engine;
 		try {
@@ -2313,7 +2313,7 @@ describe("the independent grader puts a verdict on each production answer", () =
 			(process.env as Record<string, string>).NODE_ENV = "development";
 			graderModelOverride.current = scriptedGrader([verdictCall(["present", "absent", "absent"])]).engine;
 			const pending = danglingQuestionOf(chatStore.getChat(chat.id)!.messages)!;
-			const qd = questionDataFor("explain", pending.toolCallId, parseExplainInput(pending.input)!);
+			const qd = questionDataFor("explain", pending.toolCallId, parseExplainInput(pending.input)!, { now: new Date().toISOString() });
 			const answer = buildAnswer(qd, { text: LONG("answer"), thinking: LONG("thinking"), confidence: 70, confidenceTouched: true }, "explain");
 			await drainTurn(post(chat.id, { type: "answer", toolCallId: "call-g", answer }), factory);
 			assert.deepEqual(runs, [], "a long answer, its thinking and a short reaction open no run");
@@ -2344,7 +2344,7 @@ describe("the independent grader puts a verdict on each production answer", () =
 		const factory: Parameters<typeof handleChatRequest>[1] = (opts) => createTeacherAgent(undefined, { engine, messages: opts.messages, tools });
 		await drainTurn(post(chat.id, { type: "text", text: "two at once" }), factory);
 		const pending = danglingQuestionOf(chatStore.getChat(chat.id)!.messages)!;
-		const qd = questionDataFor("explain", pending.toolCallId, parseExplainInput(pending.input)!);
+		const qd = questionDataFor("explain", pending.toolCallId, parseExplainInput(pending.input)!, { now: new Date().toISOString() });
 		const answer = buildAnswer(qd, { text: LEARNER_TEXT }, "explain");
 
 		let release!: () => void;
@@ -2397,7 +2397,7 @@ describe("recognition and prediction answers become answer entries (#10)", () =>
 		createdChats.push(chat.id);
 		await drainTurn(post(chat.id, { type: "text", text: "teach me the planets" }), agentFactory(engine));
 		const pending = danglingQuestionOf(chatStore.getChat(chat.id)!.messages)!;
-		const qd = questionDataFor("quiz", pending.toolCallId, parseQuizInput(pending.input)!);
+		const qd = questionDataFor("quiz", pending.toolCallId, parseQuizInput(pending.input)!, { now: new Date().toISOString() });
 		const answer = buildAnswer(qd, answerReq, "quiz");
 		tamper(answer);
 		await drainTurn(post(chat.id, { type: "answer", toolCallId: "call-1", answer }), agentFactory(engine));

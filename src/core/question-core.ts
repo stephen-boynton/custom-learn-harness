@@ -783,11 +783,16 @@ export function toClientQuestion(qd: QuestionData): ClientQuestion {
  * leaks correctness AND server/client render the same order
  * (hydration-safe); the display order is snapshotted into the answer
  * record at submit time.
+ *
+ * Pure: the caller supplies the creation time and, optionally, where a
+ * quiz whose correct answer does not resolve is reported (the dock logs
+ * it).
  */
 export function questionDataFor(
 	kind: QuestionKind,
 	toolCallId: string,
 	input: QuizToolInput | AskToolInput | ExplainToolInput,
+	env: { now: string; warn?: (problem: string) => void },
 ): QuestionData {
 	const quizInput = kind === "quiz" ? (input as QuizToolInput) : null;
 	const askInput = kind === "ask" ? (input as AskToolInput) : null;
@@ -817,11 +822,11 @@ export function questionDataFor(
 		context: input.details,
 		mode,
 		options: ordered,
-		createdAt: new Date().toISOString(),
+		createdAt: env.now,
 	};
 	if (quizInput) {
 		const resolved = resolveCorrect(quizInput.correctAnswer, ordered);
-		if (resolved.error) console.error("[quiz] correctAnswer did not resolve:", resolved.error);
+		if (resolved.error) env.warn?.(resolved.error);
 		q.correctIndices = resolved.indices;
 		q.explanation = quizInput.explanation;
 	}
