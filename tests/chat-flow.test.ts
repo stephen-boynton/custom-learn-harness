@@ -2024,9 +2024,12 @@ describe("the independent grader puts a verdict on each production answer", () =
 		for (const shown of [GRADED_EXPLAIN.question, GRADED_EXPLAIN.correctAnswer, ...GRADED_POINTS.map((p) => p.text), LEARNER_TEXT]) {
 			assert.ok(seen.includes(JSON.stringify(shown).slice(1, -1)), `the grader was shown: ${shown}`);
 		}
-		for (const hidden of ["LEARNER-OPENING-LINE", "TEACHER-PROSE-BEFORE-THE-QUESTION", "LEARNER-THINKING-ON-QUESTION", "LEARNER-THINKING-WHILE-READING", "confidence", "90"]) {
+		for (const hidden of ["LEARNER-OPENING-LINE", "TEACHER-PROSE-BEFORE-THE-QUESTION", "LEARNER-THINKING-ON-QUESTION", "LEARNER-THINKING-WHILE-READING", "confidence"]) {
 			assert.ok(!seen.includes(hidden), `the grader was NOT shown: ${hidden}`);
 		}
+		// The confidence value as a value of its own — never the digits
+		// inside a message timestamp (1793139089230 holds "90").
+		assert.doesNotMatch(seen, /\b90\b/, "the grader was NOT shown: 90");
 	});
 
 	it("'I don't know' never calls the grader; the teacher sees dont_know", async () => {
