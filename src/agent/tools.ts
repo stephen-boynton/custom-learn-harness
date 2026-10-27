@@ -174,9 +174,11 @@ function quizDescription(delta: { name: "quiz" | "probe"; nodeId: boolean; types
 	);
 }
 
-/** The explain mechanics (free-recall quizzing): the commitment rule is
- *  the GRADING CONTRACT — mechanics, not doctrine. The softer doctrine
- *  (near-miss reading, genuine gaps) lives in the shared prompt chunk.
+/** The explain mechanics (free-recall quizzing): the commitment rule —
+ *  full answer plus key points, committed before posing — is the
+ *  GRADING CONTRACT the independent grader judges against (spec #2,
+ *  ADR-0003) — mechanics, not doctrine. The doctrine (repairing what he
+ *  missed, genuine gaps) lives in the shared prompt chunk.
  *  `name`: the teach tool self-references as explain, the probe variant
  *  as recall (owner 2026-10-09). */
 function explainDescription(name: "explain" | "recall", nodeId: boolean): string {
@@ -185,9 +187,10 @@ function explainDescription(name: "explain" | "recall", nodeId: boolean): string
 		"answer. Unlike ask_user_question (no right answer), " +
 		name +
 		" always has one. THE COMMITMENT RULE: " +
-		"correctAnswer is the FULL correct answer in your own words, reasoning included, COMMITTED before he ever " +
-		"sees the question. When his answer returns, grade it strictly against the commitment — never revise it " +
-		"after seeing his words. He sees the committed answer on submit. " +
+		"correctAnswer is the FULL correct answer in your own words, reasoning included, and keyPoints are its " +
+		"1–4 key points (unique ids, at least one required) — both COMMITTED before he ever sees the question, " +
+		"never revised after seeing his words. An independent grader judges his answer against the key points. " +
+		"He sees the committed answer on submit. He may answer \"I don't know\". " +
 		(nodeId
 			? "Set `nodeId` (required) to the plan node this question is about — validated at call time against the session's plan map. "
 			: "") +

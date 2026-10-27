@@ -292,9 +292,11 @@ export const quizDisplayInputSchema = Type.Object({
 //
 // Quiz mechanics WITHOUT options: the learner answers in his own words.
 // The SYCOPHANCY MITIGATION is structural — the model commits to the full
-// correct answer BEFORE posing (the commitment rides the persisted call
-// args, is revealed to the learner on submit, and is restated in the answer
-// result the model grades against; the client never grades free text).
+// correct answer and its 1–4 key points BEFORE posing (the commitment rides
+// the persisted call args, is revealed to the learner on submit, and is
+// snapshotted onto the answer record; an independent grader judges the
+// answer against the key points — spec #2, ADR-0003; the client never
+// grades free text).
 // ONE committed answer, reasoning included (owner ruling 2026-09-27: the
 // separate explanation field was quiz remnant — collapsed away).
 // Mechanics doctrine lives in the TOOL DESCRIPTIONS (pi-native ruling),
