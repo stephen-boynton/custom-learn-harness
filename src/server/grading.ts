@@ -1,25 +1,20 @@
 /**
- * Grading at the answer seam (spec #2, ADR-0003): before a production
- * answer (explain / recall) is saved, the independent grader judges it and
- * the verdict is put on the answer — one write, never revised (owner,
- * 2026-10-27: grade first, then save the answer with its verdict).
- *
- * The commitment comes from the PERSISTED question call, never from the
- * client: the answer object is client-authored, so any verdict it carries
- * is dropped and the commitment snapshot is re-taken from the call.
+ * Grading at the answer seam (spec #2, ADR-0003) — the WIRING only: which
+ * answers are graded, and what is saved, is decided in core
+ * (core/answer-grading.ts). Here: the grader's engine (the extractor's
+ * role chain, read fresh), the provider-key check, the grader run and its
+ * spend.
  */
 
 import type { Usage } from "@earendil-works/pi-ai";
 import { piEngineForSpec, type PiEngine } from "../agent/models.ts";
 import { GRADER_ROLE, gradeProductionAnswer, graderModelOverride } from "../agent/subagents/grader.ts";
-import { callUsage } from "../agent/subagents/extraction.ts";
-import type { CallUsage } from "../core/contracts.ts";
-import { danglingQuestionOf, type LhMessage } from "../core/native-messages.ts";
-import { toolQuestionKind } from "../core/pending.ts";
+import { answerGradingOf } from "../core/answer-grading.ts";
+import { callUsage, type CallUsage } from "../core/contracts.ts";
+import type { LhMessage } from "../core/native-messages.ts";
 import type { QuestionAnswerData } from "../core/question-core.ts";
 import { resolveRoleSpec } from "../core/settings-resolution.ts";
 import { providerKeyMissing as providerKeyMissingEnvelope } from "../core/settings.ts";
-import { parseExplainInput } from "../core/tool-parts.ts";
 import { providerKeyPresent } from "./keys.ts";
 import { stores } from "./stores.ts";
 
@@ -38,11 +33,9 @@ function graderEngine(): PiEngine | undefined {
 }
 
 /**
- * The answer as it will be saved: client-sent verdicts dropped and, for a
- * production answer to a call with key points, the grader's verdict put
- * on it. "I don't know" is never graded; a call that predates key points
- * has nothing to grade against. Never throws — grading failures become
- * an uncertain verdict inside the grader.
+ * The answer as it will be saved (core/answer-grading.ts decides whether
+ * it is graded), with the grader's spend. Never throws — grading failures
+ * become an uncertain verdict inside the grader.
  */
 export async function withVerdict(
 	chatId: string,
@@ -50,12 +43,8 @@ export async function withVerdict(
 	toolCallId: string,
 	answer: QuestionAnswerData,
 ): Promise<{ answer: QuestionAnswerData; spend?: GraderSpend }> {
-	const { verdict: _clientVerdict, ...clean } = answer;
-	void _clientVerdict;
-	const pending = danglingQuestionOf(messages);
-	if (!pending || pending.toolCallId !== toolCallId || toolQuestionKind(pending.tool) !== "explain") return { answer: clean };
-	const call = parseExplainInput(pending.input);
-	if (!call?.keyPoints?.length || clean.dontKnow || clean.dismissed) return { answer: clean };
+	const grading = answerGradingOf(messages, toolCallId, answer);
+	if (!grading.grade) return { answer: grading.answer };
 
 	const steps: CallUsage[] = [];
 	let model = "";
@@ -65,21 +54,14 @@ export async function withVerdict(
 	} catch (err) {
 		console.error(`[chat ${chatId}] grader engine unavailable:`, err);
 	}
-	const verdict = await gradeProductionAnswer(
-		{ question: call.question, correctAnswer: call.correctAnswer, keyPoints: call.keyPoints, answer: clean.text ?? "" },
-		{
-			engine,
-			providerKeyMissing: (provider, tier) =>
-				providerKeyPresent(provider) ? null : providerKeyMissingEnvelope(provider, [tier]),
-			onUsage: (usage: Usage, stepModel) => {
-				steps.push(callUsage(usage));
-				model = stepModel;
-			},
-			chatId,
+	const verdict = await gradeProductionAnswer(grading.request, {
+		engine,
+		providerKeyMissing: (provider, tier) => (providerKeyPresent(provider) ? null : providerKeyMissingEnvelope(provider, [tier])),
+		onUsage: (usage: Usage, stepModel) => {
+			steps.push(callUsage(usage));
+			model = stepModel;
 		},
-	);
-	return {
-		answer: { ...clean, committed: call.correctAnswer, keyPoints: call.keyPoints, verdict },
-		spend: steps.length > 0 ? { model, steps } : undefined,
-	};
+		chatId,
+	});
+	return { answer: grading.withVerdict(verdict), spend: steps.length > 0 ? { model, steps } : undefined };
 }

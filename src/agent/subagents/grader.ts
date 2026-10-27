@@ -18,7 +18,7 @@ import type { Usage } from "@earendil-works/pi-ai";
 import type { PiEngine } from "../models.ts";
 import { runSubmitAgent } from "./submit-agent.ts";
 import { ROLE_SLOT, type ModelSlotName, type ProviderKeyMissing } from "../../core/settings.ts";
-import type { KeyPoint } from "../../core/question-core.ts";
+import type { GradingRequest } from "../../core/answer-grading.ts";
 import { uncertainVerdict, verdictProblem, verdictSchema, type Verdict } from "../../core/verdict.ts";
 
 /** Test seam (runner.ts's pdfModelOverride idiom): a scripted grader
@@ -33,15 +33,8 @@ export const graderTimeoutMs = { current: 20_000 };
  *  extraction-tier (cheap) slot, no settings row of its own. */
 export const GRADER_ROLE = "extractor" as const;
 
-/** Exactly what the grader is shown. */
-export interface GraderInput {
-	question: string;
-	/** The committed full answer. */
-	correctAnswer: string;
-	keyPoints: readonly KeyPoint[];
-	/** The learner's answer, verbatim. */
-	answer: string;
-}
+/** Exactly what the grader is shown (decided in core/answer-grading.ts). */
+export type GraderInput = GradingRequest;
 
 export interface GraderDeps {
 	/** The resolved engine; undefined = no model configured for the slot. */

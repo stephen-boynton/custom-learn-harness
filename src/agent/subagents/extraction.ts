@@ -23,7 +23,7 @@ import type {
 	ExtractionStageUsage,
 	SessionFindings,
 } from "../../core/contracts.ts";
-import { NOTES_SOURCE_ID_PREFIX } from "../../core/contracts.ts";
+import { callUsage, NOTES_SOURCE_ID_PREFIX } from "../../core/contracts.ts";
 import { getGraph, mergeFindings, type DerivedGraph, type EmissionStats, type GraphDeps } from "../../core/graph.ts";
 import type { GraphStore } from "../../core/ports.ts";
 import { emit } from "../../core/events.ts";
@@ -890,23 +890,6 @@ export interface ExtractionPipeline {
 	 *  path, so re-importing the same file re-runs extraction against the
 	 *  same source identity (mappings dedupe by it). */
 	importNotes(input: NotesImportInput): Promise<EmissionStats>;
-}
-
-/** pi's per-step usage, flattened to the persisted CallUsage fields
- *  (the money channel's capture shape, contracts/chat.ts). Exported for
- *  the cluster namer — the same capture shape (2026-09 graph cost
- *  metrics wave). Module scope: no closure deps, pure projection. */
-export function callUsage(usage: Usage): CallUsage {
-	return {
-		inputTokens: usage.input,
-		outputTokens: usage.output,
-		cacheReadTokens: usage.cacheRead,
-		cacheWriteTokens: usage.cacheWrite,
-		cacheWrite1hTokens: usage.cacheWrite1h ?? 0,
-		// Optional in pi's Usage (providers that never emit reasoning
-		// tokens leave it unset) — persisted as 0, never dropped.
-		reasoningTokens: usage.reasoning ?? 0,
-	};
 }
 
 export function createExtractionPipeline(deps: ExtractionPipelineDeps): ExtractionPipeline {
