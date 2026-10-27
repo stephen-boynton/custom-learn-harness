@@ -570,6 +570,14 @@ describe("AnsweredCard: the explain variant", () => {
 		assert.match(html, /Answered “I don&#x27;t know”\./);
 	});
 
+	it("shows the recorded confidence, as on a quiz (owner, 2026-10-27)", () => {
+		const html = renderToStaticMarkup(
+			<AnsweredCard answer={buildAnswer(explainQD(), { text: "Aether ruled out.", confidence: 70, confidenceTouched: true })} />,
+		);
+		assert.match(html, /data-testid="answered-confidence"/);
+		assert.match(html, /70%/);
+	});
+
 	it("old records without key points still load and render (spec #2: no backfill)", () => {
 		const oldCall = {
 			question: "Explain why the null result matters.",

@@ -520,7 +520,12 @@ export interface QuestionAnswerData {
 	 *  2026-10-03) — a separate channel from `thinking`, captured by the
 	 *  reading field and riding the check answer. Absent when empty. */
 	readingThinking?: string;
-	confidence?: number; // quiz only: the learner's stated probability (0-100, raw) that his selected answer is correct — never sent on "I don't know" (owner, 2026-10-01)
+	confidence?: number; // quiz + explain (explain since 2026-10-27): the learner's stated probability (0-100, raw) that his answer is correct — never sent on "I don't know" (owner, 2026-10-01)
+	/** Whether the learner moved the confidence slider (owner,
+	 *  2026-10-27): false = the resting default was submitted untouched.
+	 *  Present whenever `confidence` is on records from this change on;
+	 *  absent on older records. */
+	confidenceTouched?: boolean;
 	correct?: boolean; // quiz only
 	correctIndices?: number[]; // quiz only (rendering)
 	committed?: string; // explain only (rendering): the model's committed answer
@@ -550,14 +555,19 @@ export interface AnswerRequest {
 	text?: string; // ask text-mode
 	thinking?: string; // the reasoning-on-the-question channel (was `note`)
 	readingThinking?: string; // the thinking-while-reading channel (check answers)
-	confidence?: number; // quiz only: 0-100 raw probability — 50 is a real coin flip, always sent (owner, 2026-10-01)
+	confidence?: number; // quiz + explain: 0-100 raw probability, always sent on a real answer
+	/** Did the learner move the slider? (owner, 2026-10-27 — reverses the
+	 *  2026-10-01 "50 must mean 50, never untouched" ruling.) */
+	confidenceTouched?: boolean;
 }
 
 /** The confidence slider's snap stops (owner, 2026-10-01): raw probability
- *  that the selected answer is correct, uneven on purpose — resolution
+ *  that the answer is correct, uneven on purpose — resolution
  *  concentrates at the top where the calibration signal lives (90 vs 100
- *  separates knows from mastered). 50 is a genuine coin flip and the
- *  resting default — untouched and deliberate 50 are the same number. */
+ *  separates knows from mastered). 50 is the resting default; whether the
+ *  learner moved off it is recorded separately as `confidenceTouched`
+ *  (owner, 2026-10-27), so an untouched 50 is no longer read as a real
+ *  coin flip. */
 export const CONFIDENCE_STOPS: readonly number[] = [0, 30, 50, 70, 90, 100];
 export const DEFAULT_CONFIDENCE_INDEX = 2;
 
@@ -580,6 +590,7 @@ export interface QuestionFormDraft {
 	other: string;
 	text: string;
 	confidenceIndex: number;
+	confidenceTouched?: boolean;
 }
 
 export interface QuestionDraft {
@@ -857,16 +868,18 @@ export function buildAnswer(qd: QuestionData, req: AnswerRequest, tool?: string)
 		base.correctIndices = qd.correctIndices ?? [];
 		base.explanation = qd.explanation;
 		base.correct = base.dontKnow ? false : isCorrect(base.answers.map((a) => a.index), qd.correctIndices ?? []);
-		// The confidence slider rides on real quiz answers only — never on
-		// "I don't know" (no answer, no probability). Clamped defensively;
-		// the dock snaps to the grid, the record accepts any integer.
-		if (!base.dontKnow && req.confidence !== undefined) {
-			base.confidence = Math.max(0, Math.min(100, Math.round(req.confidence)));
-		}
+	}
+	// The confidence slider rides on real quiz and explain answers only
+	// (explain joined 2026-10-27) — never on "I don't know" (no answer, no
+	// probability). Clamped defensively; the dock snaps to the grid, the
+	// record accepts any integer. The untouched flag travels with it.
+	if ((qd.kind === "quiz" || qd.kind === "explain") && !base.dontKnow && req.confidence !== undefined) {
+		base.confidence = Math.max(0, Math.min(100, Math.round(req.confidence)));
+		if (req.confidenceTouched !== undefined) base.confidenceTouched = req.confidenceTouched;
 	}
 	if (qd.kind === "explain") {
-		// No client grading — the model grades in its reply, against the
-		// commitment. The commitment snapshots for the reveal + rendering.
+		// No client grading. The commitment and its key points snapshot for
+		// the reveal, rendering, and grading.
 		base.committed = qd.committedAnswer;
 		if (qd.keyPoints) base.keyPoints = qd.keyPoints;
 	}

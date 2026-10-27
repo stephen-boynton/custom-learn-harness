@@ -484,7 +484,7 @@ describe("buildAnswer", () => {
 		assert.equal(buildAnswer(quizData(), { values: ["mercury"] }).confidence, undefined);
 	});
 
-	it("drops confidence on dontKnow and on non-quiz kinds", () => {
+	it("drops confidence on dontKnow and on ask (explain carries it since 2026-10-27)", () => {
 		assert.equal(buildAnswer(quizData(), { dontKnow: true, confidence: 70 }).confidence, undefined);
 		const ask = quizData({ kind: "ask", correctIndices: undefined, explanation: undefined });
 		assert.equal(buildAnswer(ask, { other: "x", confidence: 70 }).confidence, undefined);
