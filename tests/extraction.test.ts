@@ -2643,11 +2643,13 @@ describe("checks in the extraction view (ADR-0004, #8)", () => {
 		assert.match(view, /Which rule differentiates a composition\?/);
 		assert.match(view, /The product rule/);
 		assert.match(view, /^Correct answer: The chain rule$/m);
-		// Production: question and key points (ids as authored).
+		// Production: question and key points — ids as authored, prefixed by
+		// the check's alias so they can't pass for proposition ids (owner,
+		// after #9).
 		assert.match(view, /^CHECK q2 \[a2\]/m);
 		assert.match(view, /Why does the chain rule multiply rates\?/);
-		assert.match(view, /^ {2}p1: Each layer scales the change it receives$/m);
-		assert.match(view, /^ {2}p2: Scalings compose by multiplication$/m);
+		assert.match(view, /^ {2}q2\.p1: Each layer scales the change it receives$/m);
+		assert.match(view, /^ {2}q2\.p2: Scalings compose by multiplication$/m);
 		// The checks sit in reading order, after their message's prose.
 		assert.ok(view.indexOf("TEACHER [a1]") < view.indexOf("CHECK q1") && view.indexOf("CHECK q1") < view.indexOf("TEACHER [a2]"));
 

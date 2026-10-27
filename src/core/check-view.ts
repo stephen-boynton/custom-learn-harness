@@ -23,7 +23,8 @@
  * travelled?" is exactly "is its host covered?" — no bookkeeping of its own.
  *
  * IDENTITY (owner, 2026-10-27): each check gets a BATCH-LOCAL alias (q1, q2,
- * … in reading order) and keeps its key point ids as authored. The extractor
+ * … in reading order) and keeps its key point ids as authored (shown as
+ * "q1.p1" in the block, named { check: "q1", keyPoint: "p1" } on the wire). The extractor
  * never copies a raw toolCallId; `checks` maps each alias back to its call.
  */
 
@@ -87,14 +88,15 @@ function posedCheckOf(block: { id: string; name: string; arguments: unknown }, m
 		if (!input) return undefined;
 		const keyPoints = input.keyPoints ?? [];
 		const role = normalizeQuizType(input.type) === "predict" ? "free recall, prediction" : "free recall";
-		const body = [`Question: ${input.question.trim()}`];
-		if (keyPoints.length > 0) body.push("Key points:", ...keyPoints.map((p) => `  ${p.id}: ${p.text.trim()}`));
-		return {
-			toolCallId: block.id,
-			messageId,
-			keyPointIds: keyPoints.map((p) => p.id),
-			render: (alias) => [`CHECK ${alias} [${messageId}] — ${role}`, ...body].join("\n"),
+		// Key points show prefixed by their check's alias ("q1.p1") so they
+		// can't pass for proposition ids (owner, after #9) — display only:
+		// the wire still names them { check: "q1", keyPoint: "p1" }.
+		const render = (alias: string): string => {
+			const lines = [`CHECK ${alias} [${messageId}] — ${role}`, `Question: ${input.question.trim()}`];
+			if (keyPoints.length > 0) lines.push("Key points:", ...keyPoints.map((p) => `  ${alias}.${p.id}: ${p.text.trim()}`));
+			return lines.join("\n");
 		};
+		return { toolCallId: block.id, messageId, keyPointIds: keyPoints.map((p) => p.id), render };
 	}
 	return undefined;
 }

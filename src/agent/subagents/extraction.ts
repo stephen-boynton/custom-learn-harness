@@ -228,7 +228,8 @@ const attributionSchema = Type.Object({
 	keyPoint: Type.Optional(
 		Type.String({
 			description:
-				"Free-recall checks only: the id of ONE key point, exactly as listed under the check. Omit it for a " +
+				'Free-recall checks only: the id of ONE key point listed under the check, without the check label ' +
+				'(for "q1.p2", "p2"). Omit it for a ' +
 				"multiple-choice check, which is attributed as a whole.",
 		}),
 	),
