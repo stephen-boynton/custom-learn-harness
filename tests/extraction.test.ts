@@ -3257,6 +3257,31 @@ describe("re-extraction: the newest run's attributions win (#11)", () => {
 		const attributions = ledgers.readEvidence().filter((e) => e.type === "attribution");
 		assert.equal(attributions.length, 3, "append-only: both runs' entries remain");
 	});
+
+	it("a re-extraction that attributes nothing leaves the check unattached — every check in the batch gets a run entry", async () => {
+		const { chatId } = checksChat("Empty re-attribution fixture", [
+			...assistant("a1", [
+				{ type: "text", text: "Heat flows from hot to cold by collisions until equilibrium." },
+				threePointCheck("call-heat"),
+				heatChoiceCheck("call-mc"),
+			]),
+		]);
+		const ledgers = memoryLedgers();
+		ledgers.appendEvidence(productionAnswer(chatId, "call-heat", "2026-10-20T09:00:00.000Z", { k1: "present", k2: "present", k3: "present" }));
+		await extractWith(chatId, ledgers, [attributingStep(HEAT_PROPOSITIONS, PER_POINT)]);
+		assert.match(await listPropositions(ledgers, chatId), /^- Heat flows hot to cold — held \(2026-10-20\)$/m);
+		const firstRuns = ledgers.readEvidence().filter((e) => e.type === "attributionRun");
+		assert.deepEqual(firstRuns.map((e) => e.toolCallId).sort(), ["call-heat", "call-mc"], "one run entry per check in the batch, attributed or not");
+
+		const reopened = chatStore.getChat(chatId)!.messages.map((m) =>
+			m.id === "a1" && m.role === "assistant" ? ({ ...m, content: [{ type: "text", text: "Heat flows until temperatures are equal." }, ...m.content] } as LhMessage) : m,
+		);
+		chatStore.saveMessages(chatId, reopened);
+		await extractWith(chatId, ledgers, [attributingStep([], [])]);
+
+		assert.match(await listPropositions(ledgers, chatId), /^- Heat flows hot to cold — covered only$/m);
+		assert.deepEqual(evidenceView(ledgers.readEvidence()).unattached.map((a) => a.toolCallId), ["call-heat"]);
+	});
 });
 
 // ─── recognition and prediction answers as evidence (#10) ──────────────────

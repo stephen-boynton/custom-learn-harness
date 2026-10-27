@@ -285,12 +285,17 @@ export interface SessionFindings {
 	chains: ExtractedChain[];
 	/** Session door only; absent on notes findings (no checks there). */
 	attributions?: ExtractedAttribution[];
+	/** Session door only: the toolCallId of EVERY check travelling with
+	 *  the batch, attributed or not — the merger writes one run entry each
+	 *  (#11). */
+	checkedCalls?: string[];
 }
 
 // ─── The evidence ledger (spec #2, ADR-0002 — evidence.jsonl) ───────────────
 //
-// Append-only, NEVER rewritten (not part of rewriteLedgers). Two kinds of
-// entry, both keyed by the question's toolCallId; held is DERIVED on read
+// Append-only, NEVER rewritten (not part of rewriteLedgers). Three kinds of
+// entry (answer, attribution, attribution run), all keyed by the question's
+// toolCallId; held is DERIVED on read
 // by joining them (core/evidence.ts), so an answer may land before or
 // after its question is extracted.
 
@@ -348,7 +353,21 @@ export interface AttributionEntry {
 	runId: string;
 }
 
-export type EvidenceEntry = AnswerEntry | AttributionEntry;
+/** Written by the deterministic merger for EVERY check travelling with
+ *  the merged batch, attributed or not (#11, owner after #10–#12): it
+ *  marks that this run attributed the question afresh. On read the
+ *  newest run per question decides which attributions count, so a run
+ *  that links nothing leaves the check unattached. Counts and status
+ *  ignore the run entries themselves. */
+export interface AttributionRunEntry {
+	type: "attributionRun";
+	toolCallId: string;
+	runId: string;
+	/** ISO — the merge that wrote it. */
+	at: string;
+}
+
+export type EvidenceEntry = AnswerEntry | AttributionEntry | AttributionRunEntry;
 
 /** One identity verdict: the extractor's local proposition id → the
  *  EXISTING graph node that proposition IS. On link, the session's

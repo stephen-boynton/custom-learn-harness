@@ -3,10 +3,10 @@
  * stored (spec #2, ADR-0002; glossary: held, covered, encountered,
  * attribution, unattached evidence, orphaned evidence). Pure.
  *
- * The ledger's two kinds of entry are JOINED here, on the question's
- * toolCallId (+ key point id): answers are written when graded (chat
- * handler), attributions when the question's batch is merged (the
- * extraction merger) — either may come first.
+ * Answers and attributions are JOINED here, on the question's toolCallId
+ * (+ key point id): answers are written when graded (chat handler),
+ * attributions — with a run entry per check — when the question's batch
+ * is merged (the extraction merger); either may come first.
  *
  *   - An answer with no attribution is UNATTACHED evidence: kept, moves no
  *     status.
@@ -34,8 +34,9 @@
  * No production evidence: covered only (some chat provenance) or
  * encountered only (notes provenance alone).
  *
- * Recognition and prediction evidence (#10) and the newest-run rule for
- * re-extracted attributions (#11) extend `outcomeOf` / `attributionsByCall`.
+ * Attributions count only from a question's NEWEST attribution run (#11):
+ * the merger writes a run entry for every check in a batch, so a
+ * re-extraction that attributes nothing leaves the check unattached.
  */
 
 import type { AnswerEntry, AttributionEntry, EvidenceEntry, GraphNode } from "./contracts.ts";
@@ -176,19 +177,20 @@ const byAt = (a: { at: string; seq: number }, b: { at: string; seq: number }): n
 
 export function evidenceView(entries: ReadonlyArray<EvidenceEntry>): EvidenceView {
 	const answers = new Map<string, { entry: AnswerEntry; seq: number }>();
+	// The NEWEST run wins (#11, owner 2026-10-27): a re-extraction
+	// attributes the question afresh, and its run REPLACES every earlier
+	// run's attributions of it — whole, not per key point (a key point the
+	// new run leaves out becomes unattached). The newest run per question
+	// is its last run entry; runs append in order.
+	const newestRun = new Map<string, string>();
+	for (const entry of entries) if (entry.type === "attributionRun") newestRun.set(entry.toolCallId, entry.runId);
 	const attributionsByCall = new Map<string, AttributionEntry[]>();
 	entries.forEach((entry, seq) => {
 		if (entry.type === "answer") {
 			// One answer per question; a duplicate line never replaces the first.
 			if (!answers.has(entry.toolCallId)) answers.set(entry.toolCallId, { entry, seq });
-		} else {
-			// The NEWEST run wins (#11, owner 2026-10-27): a re-extraction
-			// attributes the question afresh, and its run REPLACES every
-			// earlier run's attributions of it — whole, not per key point
-			// (a key point the new run leaves out becomes unattached).
-			// Runs append in order, so a new run id starts a new list.
-			const previous = attributionsByCall.get(entry.toolCallId);
-			const list = previous?.[0]?.runId === entry.runId ? previous : [];
+		} else if (entry.type === "attribution" && newestRun.get(entry.toolCallId) === entry.runId) {
+			const list = attributionsByCall.get(entry.toolCallId) ?? [];
 			list.push(entry);
 			attributionsByCall.set(entry.toolCallId, list);
 		}

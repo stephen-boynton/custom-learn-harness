@@ -434,6 +434,7 @@ function withAttributions(findings: SessionFindings, raw: SessionFindingsSubmit,
 	const byAlias = new Map(checks.map((c) => [c.alias, c.toolCallId]));
 	return {
 		...findings,
+		checkedCalls: checks.map((c) => c.toolCallId),
 		attributions: raw.attributions.flatMap((a) => {
 			const toolCallId = byAlias.get(a.check);
 			if (toolCallId === undefined) return [];

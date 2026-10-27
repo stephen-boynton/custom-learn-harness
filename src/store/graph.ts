@@ -138,6 +138,7 @@ const EVIDENCE_PHASES = new Set(["probe", "teach"]);
  *  validated before it was ever saved — the guard checks it is an object. */
 const isEvidenceEntry = (v: unknown): v is EvidenceEntry => {
 	if (!isRecord(v) || !isString(v.toolCallId) || !isString(v.at)) return false;
+	if (v.type === "attributionRun") return isString(v.runId);
 	if (v.type === "attribution") {
 		return isString(v.propositionId) && isString(v.runId) && (v.keyPointId === undefined || isString(v.keyPointId));
 	}
