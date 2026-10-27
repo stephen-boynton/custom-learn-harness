@@ -13,9 +13,13 @@
  *                                      another line; readers merge)
  *   sessions.jsonl  SessionCheckpoint— emission checkpoints (foldedAt)
  *   coverage.jsonl  CoverageEntry    — per-message extraction coverage
- *   evidence.jsonl  EvidenceEntry    — the evidence ledger (spec #2): answer
- *                                      and attribution entries, NEVER
- *                                      rewritten (no rewriteLedgers key)
+ *   evidence.jsonl  EvidenceEntry    — the evidence ledger (spec #2), split
+ *   evidence-answers.jsonl             by writer: answer entries (chat
+ *                                      handler) in evidence-answers.jsonl,
+ *                                      attribution + attribution-run
+ *                                      entries (merger) in evidence.jsonl.
+ *                                      NEVER rewritten (no rewriteLedgers
+ *                                      key)
  *
  * CHAINS-PRIMARY (owner, 2026-09-30): there is NO edges ledger — the edge
  * view (implication nodes + untyped arrows) is derived in core/graph.ts on
@@ -138,6 +142,7 @@ const EVIDENCE_PHASES = new Set(["probe", "teach"]);
  *  validated before it was ever saved — the guard checks it is an object. */
 const isEvidenceEntry = (v: unknown): v is EvidenceEntry => {
 	if (!isRecord(v) || !isString(v.toolCallId) || !isString(v.at)) return false;
+	if (v.type === "attributionRun") return isString(v.runId);
 	if (v.type === "attribution") {
 		return isString(v.propositionId) && isString(v.runId) && (v.keyPointId === undefined || isString(v.keyPointId));
 	}
@@ -192,12 +197,18 @@ export const graphStore: GraphStore = {
 	},
 
 	/** The evidence ledger — append-only, never rewritten (no
-	 *  rewriteLedgers key). */
+	 *  rewriteLedgers key), one file per writer: answers (the chat
+	 *  handler) apart from attributions and runs (the merger). */
 	appendEvidence(entry: EvidenceEntry): void {
-		appendLine(LEDGER_FILES.evidence, entry);
+		appendLine(entry.type === "answer" ? LEDGER_FILES.evidenceAnswers : LEDGER_FILES.evidence, entry);
 	},
+	/** Answers first, then attributions and runs — each file in append
+	 *  order (the derivation needs order only within an entry kind). */
 	readEvidence(): EvidenceEntry[] {
-		return readValid(LEDGER_FILES.evidence, isEvidenceEntry);
+		return [
+			...readValid(LEDGER_FILES.evidenceAnswers, isEvidenceEntry).filter((e) => e.type === "answer"),
+			...readValid(LEDGER_FILES.evidence, isEvidenceEntry).filter((e) => e.type !== "answer"),
+		];
 	},
 
 	// ── imported-notes bookkeeping (config.SOURCES_FILE — a JSON map) ──

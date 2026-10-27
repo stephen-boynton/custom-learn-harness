@@ -2732,6 +2732,24 @@ describe("checks in the extraction view (ADR-0004, #8)", () => {
 		assert.doesNotMatch(view!, /ASK-SECRET/);
 	});
 
+	it("an old explain or recall with no key points is left out of the view", async () => {
+		const old = (toolCallId: string, name: "explain" | "recall"): NativeCallDesc => {
+			const check = explainCheck(toolCallId);
+			const { keyPoints: _none, ...input } = check.input as Record<string, unknown>;
+			void _none;
+			return { ...check, name, input: { ...input, question: `OLD-${name}?` } };
+		};
+		const { chatId } = checksChat("Old records fixture", [
+			...assistant("a1", [{ type: "text", text: "From before key points existed." }, old("call-old-ex", "explain"), old("call-old-rc", "recall")]),
+			user("u1", "ok"),
+			...assistant("a2", [{ type: "text", text: "A current one." }, explainCheck("call-new")]),
+		]);
+		const [view] = (await extractViews(chatId)).views;
+		assert.doesNotMatch(view!, /OLD-/);
+		assert.equal((view!.match(/^CHECK /gm) ?? []).length, 1);
+		assert.match(view!, /^CHECK q1 \[a2\] — free recall$/m);
+	});
+
 	it("check lines count toward the fill budget, never toward coverage tokens", async () => {
 		const bigCheck = mcCheck("call-big", { question: `Which of these? ${"clause ".repeat(400)}` });
 		const prose = (n: number) => ({ type: "text", text: `topic ${n}: ${"detail ".repeat(700)}${n}` });
@@ -2977,6 +2995,22 @@ describe("held status from production evidence (#9)", () => {
 		assert.match(out, /^- Heat flows hot to cold — not held \(2026-10-21\)$/m);
 		assert.match(out, /^- Collisions carry heat — not held \(2026-10-21\)$/m);
 		assert.match(out, /^- Thermal equilibrium — covered only$/m, "an unattributed proposition is untouched");
+	});
+
+	it("an off-target answer counts as not held for every proposition its key points were attributed to — as it fails pass", async () => {
+		const { chatId } = checksChat("Off-target fixture", [
+			...assistant("a1", [{ type: "text", text: "Heat flows from hot to cold by collisions until equilibrium." }, threePointCheck("call-heat")]),
+		]);
+		const ledgers = memoryLedgers();
+		const answer = productionAnswer(chatId, "call-heat", "2026-10-21T09:00:00.000Z", { k1: "present", k2: "contradicted", k3: "absent" });
+		answer.verdict!.attempt = "off_target";
+		ledgers.appendEvidence(answer);
+		await extractWith(chatId, ledgers, [attributingStep(HEAT_PROPOSITIONS, PER_POINT)]);
+
+		const out = await listPropositions(ledgers, chatId);
+		for (const name of ["Heat flows hot to cold", "Collisions carry heat", "Thermal equilibrium"]) {
+			assert.match(out, new RegExp(`^- ${name} — not held \\(2026-10-21\\)$`, "m"));
+		}
 	});
 
 	it("probe evidence makes a proposition held though it was never taught", async () => {
@@ -3241,6 +3275,31 @@ describe("re-extraction: the newest run's attributions win (#11)", () => {
 		const attributions = ledgers.readEvidence().filter((e) => e.type === "attribution");
 		assert.equal(attributions.length, 3, "append-only: both runs' entries remain");
 	});
+
+	it("a re-extraction that attributes nothing leaves the check unattached — every check in the batch gets a run entry", async () => {
+		const { chatId } = checksChat("Empty re-attribution fixture", [
+			...assistant("a1", [
+				{ type: "text", text: "Heat flows from hot to cold by collisions until equilibrium." },
+				threePointCheck("call-heat"),
+				heatChoiceCheck("call-mc"),
+			]),
+		]);
+		const ledgers = memoryLedgers();
+		ledgers.appendEvidence(productionAnswer(chatId, "call-heat", "2026-10-20T09:00:00.000Z", { k1: "present", k2: "present", k3: "present" }));
+		await extractWith(chatId, ledgers, [attributingStep(HEAT_PROPOSITIONS, PER_POINT)]);
+		assert.match(await listPropositions(ledgers, chatId), /^- Heat flows hot to cold — held \(2026-10-20\)$/m);
+		const firstRuns = ledgers.readEvidence().filter((e) => e.type === "attributionRun");
+		assert.deepEqual(firstRuns.map((e) => e.toolCallId).sort(), ["call-heat", "call-mc"], "one run entry per check in the batch, attributed or not");
+
+		const reopened = chatStore.getChat(chatId)!.messages.map((m) =>
+			m.id === "a1" && m.role === "assistant" ? ({ ...m, content: [{ type: "text", text: "Heat flows until temperatures are equal." }, ...m.content] } as LhMessage) : m,
+		);
+		chatStore.saveMessages(chatId, reopened);
+		await extractWith(chatId, ledgers, [attributingStep([], [])]);
+
+		assert.match(await listPropositions(ledgers, chatId), /^- Heat flows hot to cold — covered only$/m);
+		assert.deepEqual(evidenceView(ledgers.readEvidence()).unattached.map((a) => a.toolCallId), ["call-heat"]);
+	});
 });
 
 // ─── recognition and prediction answers as evidence (#10) ──────────────────
@@ -3345,6 +3404,46 @@ describe("recognition and prediction answers as evidence (#10)", () => {
 		ledgers.appendEvidence(choiceAnswer(chatId, "call-mc", "2026-10-23T09:00:00.000Z", false));
 		await extractWith(chatId, ledgers, [attributingStep(HEAT_PROPOSITIONS.slice(0, 1), CHOICE_THEN_RECALL)]);
 		assert.match(await listPropositions(ledgers, chatId), /^- Heat flows hot to cold — not held \(2026-10-23\)$/m);
+	});
+
+	it("a later correct recognition answer clears an earlier wrong one back to covered only — never to held", async () => {
+		const { chatId } = checksChat("MC recovery fixture", [
+			...assistant("a1", [{ type: "text", text: "Heat flows from hot to cold by collisions until equilibrium." }, heatChoiceCheck("call-mc-1")]),
+			user("u1", "ok"),
+			...assistant("a2", [{ type: "text", text: "Now say it in your own words." }, threePointCheck("call-recall", "In your words: how does heat move?")]),
+			user("u2", "ok"),
+			...assistant("a3", [{ type: "text", text: "Once more, pick one." }, heatChoiceCheck("call-mc-2")]),
+		]);
+		const attributions = [
+			{ check: "q1", propositions: ["p1"] },
+			{ check: "q2", keyPoint: "k1", propositions: ["p1"] },
+			{ check: "q3", propositions: ["p1"] },
+		];
+		for (const [label, held] of [
+			["wrong then correct", false],
+			["held, then wrong, then correct", true],
+		] as const) {
+			const ledgers = memoryLedgers();
+			if (held) ledgers.appendEvidence(productionAnswer(chatId, "call-recall", "2026-10-20T09:00:00.000Z", { k1: "present", k2: "absent", k3: "absent" }));
+			ledgers.appendEvidence(choiceAnswer(chatId, "call-mc-1", "2026-10-21T09:00:00.000Z", false));
+			ledgers.appendEvidence(choiceAnswer(chatId, "call-mc-2", "2026-10-22T09:00:00.000Z", true));
+			await extractWith(chatId, ledgers, [attributingStep(HEAT_PROPOSITIONS.slice(0, 1), attributions)]);
+			assert.match(await listPropositions(ledgers, chatId), /^- Heat flows hot to cold — covered only$/m, label);
+		}
+	});
+
+	it("a correct recognition answer clears neither a production miss nor a production pass", async () => {
+		for (const [label, statuses, expected] of [
+			["miss", { k1: "absent", k2: "absent", k3: "absent" }, /^- Heat flows hot to cold — not held \(2026-10-21\)$/m],
+			["pass", { k1: "present", k2: "absent", k3: "absent" }, /^- Heat flows hot to cold — held \(2026-10-21\)$/m],
+		] as const) {
+			const { chatId } = choiceThenRecallChat(`MC after production ${label} fixture`);
+			const ledgers = memoryLedgers();
+			ledgers.appendEvidence(productionAnswer(chatId, "call-recall", "2026-10-21T09:00:00.000Z", statuses));
+			ledgers.appendEvidence(choiceAnswer(chatId, "call-mc", "2026-10-23T09:00:00.000Z", true));
+			await extractWith(chatId, ledgers, [attributingStep(HEAT_PROPOSITIONS.slice(0, 1), CHOICE_THEN_RECALL)]);
+			assert.match(await listPropositions(ledgers, chatId), expected, label);
+		}
 	});
 
 	it("a wrong prediction, or \"I don't know\" on one, is neutral: recorded, never moves status", async () => {

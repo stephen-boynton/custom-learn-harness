@@ -3,10 +3,10 @@
  * stored (spec #2, ADR-0002; glossary: held, covered, encountered,
  * attribution, unattached evidence, orphaned evidence). Pure.
  *
- * The ledger's two kinds of entry are JOINED here, on the question's
- * toolCallId (+ key point id): answers are written when graded (chat
- * handler), attributions when the question's batch is merged (the
- * extraction merger) — either may come first.
+ * Answers and attributions are JOINED here, on the question's toolCallId
+ * (+ key point id): answers are written when graded (chat handler),
+ * attributions — with a run entry per check — when the question's batch
+ * is merged (the extraction merger); either may come first.
  *
  *   - An answer with no attribution is UNATTACHED evidence: kept, moves no
  *     status.
@@ -20,30 +20,34 @@
  *   held          its key point present, and no contradiction or extra
  *                 error touching it;
  *   misconception its key point contradicted;
- *   not held      its key point absent, an extra error in the answer, or
- *                 "I don't know" (which counts against every proposition
- *                 attributed to the question).
+ *   not held      its key point absent, an extra error in the answer, an
+ *                 off-target answer, or "I don't know" (the last three
+ *                 count against every proposition attributed to the
+ *                 question).
  * A RECOGNITION answer (#10) takes its place in that same order but can
- * only count against: a wrong one, or "I don't know", is not held until a
- * later production pass; a correct one says nothing. A PREDICTION never
- * moves status, right or wrong (owner, 2026-10-27).
+ * never make held: a wrong one, or "I don't know", is not held until a
+ * later production pass; a correct one that is the latest recognition
+ * evidence, with no production evidence since, CLEARS an earlier wrong one
+ * back to covered only / encountered only (owner, after #10) — otherwise
+ * it says nothing. A PREDICTION never moves status, right or wrong
+ * (owner, 2026-10-27).
  * No production evidence: covered only (some chat provenance) or
  * encountered only (notes provenance alone).
  *
- * Recognition and prediction evidence (#10) and the newest-run rule for
- * re-extracted attributions (#11) extend `outcomeOf` / `attributionsByCall`.
+ * Attributions count only from a question's NEWEST attribution run (#11):
+ * the merger writes a run entry for every check in a batch, so a
+ * re-extraction that attributes nothing leaves the check unattached.
  */
 
-import type { AnswerEntry, AttributionEntry, EvidenceEntry, GraphNode } from "./contracts.ts";
+import { isNotesSourceId, type AnswerEntry, type AttributionEntry, type EvidenceEntry, type GraphNode } from "./contracts.ts";
 import { hasProbeDone, type LhMessage } from "./native-messages.ts";
-import { toolQuestionKind } from "./pending.ts";
-import { normalizeOptions, normalizeQuizType, resolveCorrect, type QuestionAnswerData } from "./question-core.ts";
-import { parseExplainInput, parseQuizInput } from "./tool-parts.ts";
+import { gradedCheckOf } from "./graded-check.ts";
+import type { QuestionAnswerData } from "./question-core.ts";
 
 /**
  * The ANSWER ENTRY for one answered question, read off the SAVED record
  * (the question call and its toolResult) — undefined when the answer is
- * not evidence (see gradedKindOf) or is a dismissal. Free recall is
+ * not evidence (core/graded-check.ts) or is a dismissal. Free recall is
  * PRODUCTION; multiple choice is RECOGNITION (#10); either with
  * `type: "predict"` is a PREDICTION (owner, 2026-10-27): recorded, never
  * makes held. Phase: probe until the transcript's probe_done, teach after.
@@ -57,8 +61,10 @@ export function answerEntryFor(chatId: string, messages: readonly LhMessage[], t
 	if (asking.role !== "assistant") return undefined;
 	const call = asking.content.find((b) => b.type === "toolCall" && b.id === toolCallId);
 	if (call?.type !== "toolCall") return undefined;
-	const graded = gradedKindOf(call.name, call.arguments);
+	const graded = gradedCheckOf(call.name, call.arguments);
 	if (!graded) return undefined;
+	const correctValues =
+		graded.mechanic === "multiple_choice" ? graded.correctIndices.map((i) => graded.options[i - 1]!.value) : undefined;
 	const result = messages.find((m) => m.role === "toolResult" && m.toolCallId === toolCallId);
 	if (result?.role !== "toolResult" || result.isError) return undefined;
 	const answer = result.details as QuestionAnswerData | undefined;
@@ -74,38 +80,11 @@ export function answerEntryFor(chatId: string, messages: readonly LhMessage[], t
 		phase: hasProbeDone(messages.slice(0, askingIndex)) ? "teach" : "probe",
 		dontKnow,
 		...(answer.verdict ? { verdict: answer.verdict } : {}),
-		...(graded.correctValues ? { correct: !dontKnow && choseExactly(answer, graded.correctValues) } : {}),
+		...(correctValues ? { correct: !dontKnow && choseExactly(answer, correctValues) } : {}),
 		...(typeof answer.confidence === "number" ? { confidence: answer.confidence } : {}),
 		...(typeof answer.confidenceTouched === "boolean" ? { confidenceTouched: answer.confidenceTouched } : {}),
 		...((answer.thinking ?? answer.note) ? { thinking: answer.thinking ?? answer.note } : {}),
 		at,
-	};
-}
-
-/** The evidence kind of a question call, with a multiple-choice call's
- *  committed correct option values — undefined when its answer is not
- *  evidence: an ask, a free-recall call with no key points, or a
- *  multiple-choice call whose correct answer does not resolve (nothing
- *  committed to grade against). */
-function gradedKindOf(
-	toolName: string,
-	args: unknown,
-): { kind: AnswerEntry["kind"]; correctValues?: readonly string[] } | undefined {
-	const tool = toolQuestionKind(toolName);
-	if (tool === "explain") {
-		const input = parseExplainInput(args);
-		if (!input?.keyPoints?.length) return undefined;
-		return { kind: normalizeQuizType(input.type) === "predict" ? "prediction" : "production" };
-	}
-	if (tool !== "quiz") return undefined;
-	const input = parseQuizInput(args);
-	if (!input) return undefined;
-	const options = normalizeOptions(input.options);
-	const resolved = resolveCorrect(input.correctAnswer, options);
-	if (resolved.error) return undefined;
-	return {
-		kind: normalizeQuizType(input.type) === "predict" ? "prediction" : "recognition",
-		correctValues: resolved.indices.map((i) => options[i - 1]!.value),
 	};
 }
 
@@ -140,20 +119,19 @@ export interface EvidenceView {
 	answerCountOf(nodeId: string): number;
 }
 
-/** Imported-notes source ids are "src_" + a path hash (the notes front
- *  door, agent/subagents/extraction.ts) — everything else is a chat. */
-const isNotesSourceId = (id: string): boolean => id.startsWith("src_");
-
-/** What one answer says about one proposition, or undefined when it says
- *  nothing (an uncertain verdict, a correct recognition answer, any
- *  prediction). */
-function outcomeOf(answer: AnswerEntry, keyPointIds: ReadonlyArray<string | undefined>): HeldStatus | undefined {
-	// Recognition can count against held, never make it (#10).
-	if (answer.kind === "recognition") return answer.dontKnow || answer.correct === false ? "not_held" : undefined;
+/** What one answer says about one proposition: a status, "recovered" (a
+ *  correct recognition answer — it can clear an earlier wrong one, never
+ *  make held), or undefined when it says nothing (an uncertain verdict,
+ *  any prediction). */
+function outcomeOf(answer: AnswerEntry, keyPointIds: ReadonlyArray<string | undefined>): HeldStatus | "recovered" | undefined {
+	if (answer.kind === "recognition") return answer.dontKnow || answer.correct === false ? "not_held" : "recovered";
 	if (answer.kind !== "production") return undefined;
 	if (answer.dontKnow) return "not_held";
 	const v = answer.verdict;
 	if (!v || v.uncertain) return undefined;
+	// Off target fails pass (verdict.ts answerPasses) — not held for every
+	// idea the answer was attributed to (owner, code review).
+	if (v.attempt === "off_target") return "not_held";
 	const status = new Map(v.points.map((p) => [p.id, p.status]));
 	// One proposition may be tested by more than one key point of the
 	// same answer: it is held only when every one of them is present.
@@ -169,19 +147,20 @@ const byAt = (a: { at: string; seq: number }, b: { at: string; seq: number }): n
 
 export function evidenceView(entries: ReadonlyArray<EvidenceEntry>): EvidenceView {
 	const answers = new Map<string, { entry: AnswerEntry; seq: number }>();
+	// The NEWEST run wins (#11, owner 2026-10-27): a re-extraction
+	// attributes the question afresh, and its run REPLACES every earlier
+	// run's attributions of it — whole, not per key point (a key point the
+	// new run leaves out becomes unattached). The newest run per question
+	// is its last run entry; runs append in order.
+	const newestRun = new Map<string, string>();
+	for (const entry of entries) if (entry.type === "attributionRun") newestRun.set(entry.toolCallId, entry.runId);
 	const attributionsByCall = new Map<string, AttributionEntry[]>();
 	entries.forEach((entry, seq) => {
 		if (entry.type === "answer") {
 			// One answer per question; a duplicate line never replaces the first.
 			if (!answers.has(entry.toolCallId)) answers.set(entry.toolCallId, { entry, seq });
-		} else {
-			// The NEWEST run wins (#11, owner 2026-10-27): a re-extraction
-			// attributes the question afresh, and its run REPLACES every
-			// earlier run's attributions of it — whole, not per key point
-			// (a key point the new run leaves out becomes unattached).
-			// Runs append in order, so a new run id starts a new list.
-			const previous = attributionsByCall.get(entry.toolCallId);
-			const list = previous?.[0]?.runId === entry.runId ? previous : [];
+		} else if (entry.type === "attribution" && newestRun.get(entry.toolCallId) === entry.runId) {
+			const list = attributionsByCall.get(entry.toolCallId) ?? [];
 			list.push(entry);
 			attributionsByCall.set(entry.toolCallId, list);
 		}
@@ -214,14 +193,21 @@ export function evidenceView(entries: ReadonlyArray<EvidenceEntry>): EvidenceVie
 		unattached,
 		answerCountOf: (nodeId) => evidenceOf.get(nodeId)?.length ?? 0,
 		statusOf(node: GraphNode): PropositionEvidence {
+			const noEvidence = (): PropositionEvidence => ({
+				status: node.provenance.some((pt) => !isNotesSourceId(pt.chatId)) ? "covered_only" : "encountered_only",
+			});
 			const list = evidenceOf.get(node.id) ?? [];
+			// Newest first. A correct recognition answer with no production
+			// evidence since clears the wrong recognition answer before it.
+			let recovered = false;
 			for (let i = list.length - 1; i >= 0; i--) {
 				const { answer, keyPointIds } = list[i]!;
 				const status = outcomeOf(answer, keyPointIds);
-				if (status) return { status, latestAt: answer.at };
+				if (status === "recovered") recovered = true;
+				else if (status && recovered && answer.kind === "recognition") return noEvidence();
+				else if (status) return { status, latestAt: answer.at };
 			}
-			const covered = node.provenance.some((pt) => !isNotesSourceId(pt.chatId));
-			return { status: covered ? "covered_only" : "encountered_only" };
+			return noEvidence();
 		},
 	};
 }

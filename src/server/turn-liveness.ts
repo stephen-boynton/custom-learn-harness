@@ -75,3 +75,35 @@ export function isTurnRunning(chatId: string): boolean {
 	}
 	return true;
 }
+
+// ─── answers being graded (spec #2) ─────────────────────────────────────────
+
+interface LhGradingGlobal {
+	__lhGradingRegistry?: Set<string>;
+}
+
+/** Answers being graded right now, by `chatId toolCallId` — globalThis for
+ *  the same reason as the turn registry. Event-free: grading is not a turn. */
+function gradingRegistry(): Set<string> {
+	const g = globalThis as typeof globalThis & LhGradingGlobal;
+	return (g.__lhGradingRegistry ??= new Set<string>());
+}
+
+/**
+ * Mark an answer as being graded. Returns false if the same answer is
+ * already being graded — a concurrent duplicate submit, which the caller
+ * refuses like a second turn. The turn guard covers an answer that starts
+ * a turn; this covers the deferred sibling answer (no turn), so a
+ * duplicate never calls the grader twice.
+ */
+export function beginGrading(chatId: string, toolCallId: string): boolean {
+	const key = `${chatId} ${toolCallId}`;
+	const inGrading = gradingRegistry();
+	if (inGrading.has(key)) return false;
+	inGrading.add(key);
+	return true;
+}
+
+export function endGrading(chatId: string, toolCallId: string): void {
+	gradingRegistry().delete(`${chatId} ${toolCallId}`);
+}

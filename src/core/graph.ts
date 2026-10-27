@@ -297,6 +297,11 @@ export function mergeFindings(
 	//     again. Every line carries THIS merge's run id: on read, a
 	//     question's newest run replaces its earlier ones (#11).
 	const runId = `run_${randomBytes(6).toString("hex")}`;
+	// The run entries first — one per check in the batch, attributed or
+	// not — so a run that links nothing still replaces the older ones.
+	for (const toolCallId of new Set(findings.checkedCalls ?? [])) {
+		ledgers.appendEvidence({ type: "attributionRun", toolCallId, runId, at: now });
+	}
 	for (const attribution of findings.attributions ?? []) {
 		const targets = new Set(
 			attribution.propositions.map(

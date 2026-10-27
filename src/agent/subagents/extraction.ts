@@ -23,6 +23,7 @@ import type {
 	ExtractionStageUsage,
 	SessionFindings,
 } from "../../core/contracts.ts";
+import { callUsage, NOTES_SOURCE_ID_PREFIX } from "../../core/contracts.ts";
 import { getGraph, mergeFindings, type DerivedGraph, type EmissionStats, type GraphDeps } from "../../core/graph.ts";
 import type { GraphStore } from "../../core/ports.ts";
 import { emit } from "../../core/events.ts";
@@ -434,6 +435,7 @@ function withAttributions(findings: SessionFindings, raw: SessionFindingsSubmit,
 	const byAlias = new Map(checks.map((c) => [c.alias, c.toolCallId]));
 	return {
 		...findings,
+		checkedCalls: checks.map((c) => c.toolCallId),
 		attributions: raw.attributions.flatMap((a) => {
 			const toolCallId = byAlias.get(a.check);
 			if (toolCallId === undefined) return [];
@@ -888,23 +890,6 @@ export interface ExtractionPipeline {
 	 *  path, so re-importing the same file re-runs extraction against the
 	 *  same source identity (mappings dedupe by it). */
 	importNotes(input: NotesImportInput): Promise<EmissionStats>;
-}
-
-/** pi's per-step usage, flattened to the persisted CallUsage fields
- *  (the money channel's capture shape, contracts/chat.ts). Exported for
- *  the cluster namer — the same capture shape (2026-09 graph cost
- *  metrics wave). Module scope: no closure deps, pure projection. */
-export function callUsage(usage: Usage): CallUsage {
-	return {
-		inputTokens: usage.input,
-		outputTokens: usage.output,
-		cacheReadTokens: usage.cacheRead,
-		cacheWriteTokens: usage.cacheWrite,
-		cacheWrite1hTokens: usage.cacheWrite1h ?? 0,
-		// Optional in pi's Usage (providers that never emit reasoning
-		// tokens leave it unset) — persisted as 0, never dropped.
-		reasoningTokens: usage.reasoning ?? 0,
-	};
 }
 
 export function createExtractionPipeline(deps: ExtractionPipelineDeps): ExtractionPipeline {
@@ -1548,7 +1533,7 @@ export function createExtractionPipeline(deps: ExtractionPipelineDeps): Extracti
 	/** Every explicit import processes the whole file. Identity, source digest,
 	 * auditor and usage history remain source-scoped; this is not exactly-once. */
 	async function importNotes(input: NotesImportInput): Promise<EmissionStats> {
-		const id = `src_${crypto.createHash("sha256").update(input.filePath).digest("hex").slice(0, 12)}`;
+		const id = `${NOTES_SOURCE_ID_PREFIX}${crypto.createHash("sha256").update(input.filePath).digest("hex").slice(0, 12)}`;
 		// Acquire BEFORE source upsert: overlapping contents must not alter metadata.
 		if (inFlight.has(id)) throw new NotesImportError("busy", { nodes: 0, chains: 0 }, "This file is already being imported. Try again when it finishes.");
 		inFlight.add(id);

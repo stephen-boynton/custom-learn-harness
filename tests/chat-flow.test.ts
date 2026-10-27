@@ -29,9 +29,10 @@ import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { bareQuestionTools, createTeacherAgent } from "../src/agent/teacher-agent.ts";
 import { createTeacherTools, probeExplainTool, teachExplainToolFor } from "../src/agent/tools.ts";
 import { graderModelOverride, graderTimeoutMs } from "../src/agent/subagents/grader.ts";
-import { handleChatInput, handleChatRequest } from "../src/server/chat-handler.ts";
+import { extraction, handleChatInput, handleChatRequest } from "../src/server/chat-handler.ts";
+import { coverageOf } from "../src/core/coverage.ts";
 import { effectiveSettings, stores } from "../src/server/stores.ts";
-import type { AnswerEntry, EvidenceEntry } from "../src/core/contracts.ts";
+import type { AnswerEntry, CoverageEntry, EvidenceEntry } from "../src/core/contracts.ts";
 import { isTurnRunning } from "../src/server/turn-liveness.ts";
 import { deliverJobResult, registerLiveAgent, setTurnRunner, steerLiveChat, unregisterLiveAgent } from "../src/server/jobs.ts";
 import { SessionModel } from "../components/session-core.ts";
@@ -1848,7 +1849,7 @@ describe("explain and recall commit key points — ungradeable commitments are r
 
 		// The dock's own path: the question data built from the posed call,
 		// then the learner's answer.
-		const qd = questionDataFor("explain", pending!.toolCallId, parseExplainInput(pending!.input)!);
+		const qd = questionDataFor("explain", pending!.toolCallId, parseExplainInput(pending!.input)!, { now: new Date().toISOString() });
 		const answer = buildAnswer(qd, { text: "It is always near the Sun." }, "explain");
 		await drainTurn(post(chat.id, { type: "answer", toolCallId: "call-kp", answer }), factory);
 
@@ -1858,6 +1859,42 @@ describe("explain and recall commit key points — ungradeable commitments are r
 		};
 		assert.equal(result.details?.committed, TEACH_EXPLAIN.correctAnswer);
 		assert.deepEqual(result.details?.keyPoints, KEY_POINTS, "the key points ride the answer record beside the commitment");
+	});
+});
+
+describe("old explain/recall records without key points still load", () => {
+	it("the golden teach chat (recall ×1, explain ×2, no key points) loads, its record reads back, and a new turn runs over it", async () => {
+		const golden = JSON.parse(
+			fs.readFileSync(path.join(import.meta.dirname, "fixtures", "golden-data", "chats", "chat_mv27rrra_feff23b6.json"), "utf-8"),
+		) as { messages: LhMessage[] };
+		const oldCalls = golden.messages.flatMap((m) =>
+			m.role === "assistant" ? m.content.filter((b) => b.type === "toolCall" && (b.name === "explain" || b.name === "recall")) : [],
+		);
+		assert.equal(oldCalls.length, 3, "the fixture still holds the three old free-recall calls");
+		assert.ok(oldCalls.every((b) => b.type === "toolCall" && !("keyPoints" in b.arguments)), "none has key points");
+
+		const chat = createConfiguredChat("Test: old free-recall records");
+		createdChats.push(chat.id);
+		chatStore.saveMessages(chat.id, golden.messages);
+		const before = evidenceLines.length;
+
+		const res = await recordRoute.GET(new Request("http://test/record"), { params: Promise.resolve({ id: chat.id }) });
+		assert.equal(res.status, 200);
+		const snapshot = (await res.json()) as { messages: LhMessage[] };
+		assert.equal(snapshot.messages.length, golden.messages.length);
+		assert.doesNotThrow(() => projectView(snapshot.messages));
+
+		const { engine, calls } = scriptedTeacher((cs) => [
+			(context) => {
+				cs.push(context.messages.map((m) => JSON.stringify((m as { content: unknown }).content)));
+				return fauxAssistantMessage([fauxText("Picking up where we left off.")]);
+			},
+		]);
+		const body = await drainTurn(post(chat.id, { type: "text", text: "Let's continue." }), agentFactory(engine));
+		assert.deepEqual(eventsOf(body).filter((e) => e.type === "error"), []);
+		assert.equal(calls.length, 1, "the teacher ran over the old history");
+		assert.ok(calls[0]!.join(" ").includes("It is updated with the Bayes theorem"), "the old recall answer is in its context");
+		assert.equal(evidenceLines.length, before, "loading old records writes no evidence");
 	});
 });
 
@@ -1931,7 +1968,7 @@ describe("the independent grader puts a verdict on each production answer", () =
 			createTeacherAgent(undefined, { engine, messages: opts.messages, tools });
 		await drainTurn(post(chat.id, { type: "text", text: "LEARNER-OPENING-LINE" }), factory);
 		const pending = danglingQuestionOf(chatStore.getChat(chat.id)!.messages)!;
-		const qd = questionDataFor("explain", pending.toolCallId, parseExplainInput(pending.input)!);
+		const qd = questionDataFor("explain", pending.toolCallId, parseExplainInput(pending.input)!, { now: new Date().toISOString() });
 		const answer = buildAnswer(qd, answerReq, "explain");
 		graderModelOverride.current = grader;
 		try {
@@ -1987,9 +2024,12 @@ describe("the independent grader puts a verdict on each production answer", () =
 		for (const shown of [GRADED_EXPLAIN.question, GRADED_EXPLAIN.correctAnswer, ...GRADED_POINTS.map((p) => p.text), LEARNER_TEXT]) {
 			assert.ok(seen.includes(JSON.stringify(shown).slice(1, -1)), `the grader was shown: ${shown}`);
 		}
-		for (const hidden of ["LEARNER-OPENING-LINE", "TEACHER-PROSE-BEFORE-THE-QUESTION", "LEARNER-THINKING-ON-QUESTION", "LEARNER-THINKING-WHILE-READING", "confidence", "90"]) {
+		for (const hidden of ["LEARNER-OPENING-LINE", "TEACHER-PROSE-BEFORE-THE-QUESTION", "LEARNER-THINKING-ON-QUESTION", "LEARNER-THINKING-WHILE-READING", "confidence"]) {
 			assert.ok(!seen.includes(hidden), `the grader was NOT shown: ${hidden}`);
 		}
+		// The confidence value as a value of its own — never the digits
+		// inside a message timestamp (1793139089230 holds "90").
+		assert.doesNotMatch(seen, /\b90\b/, "the grader was NOT shown: 90");
 	});
 
 	it("'I don't know' never calls the grader; the teacher sees dont_know", async () => {
@@ -2190,7 +2230,7 @@ describe("the independent grader puts a verdict on each production answer", () =
 		const factory: Parameters<typeof handleChatRequest>[1] = (opts) => createTeacherAgent(undefined, { engine, messages: opts.messages, tools });
 		await drainTurn(post(chat.id, { type: "text", text: "go" }), factory);
 		const pending = danglingQuestionOf(chatStore.getChat(chat.id)!.messages)!;
-		const qd = questionDataFor("explain", pending.toolCallId, parseExplainInput(pending.input)!);
+		const qd = questionDataFor("explain", pending.toolCallId, parseExplainInput(pending.input)!, { now: new Date().toISOString() });
 		graderModelOverride.current = grader.engine;
 		try {
 			const dontKnow = { ...buildAnswer(qd, { dontKnow: true }, "explain"), verdict: forged };
@@ -2222,7 +2262,7 @@ describe("the independent grader puts a verdict on each production answer", () =
 		await drainTurn(post(chat.id, { type: "text", text: "two at once" }), factory);
 		const pending = danglingQuestionOf(chatStore.getChat(chat.id)!.messages)!;
 		assert.equal(pending.toolCallId, "call-g");
-		const qd = questionDataFor("explain", pending.toolCallId, parseExplainInput(pending.input)!);
+		const qd = questionDataFor("explain", pending.toolCallId, parseExplainInput(pending.input)!, { now: new Date().toISOString() });
 		const grader = scriptedGrader([verdictCall(["present", "contradicted", "absent"])]);
 		graderModelOverride.current = grader.engine;
 		try {
@@ -2241,6 +2281,105 @@ describe("the independent grader puts a verdict on each production answer", () =
 		);
 		assert.equal(calls.length, 1, "the last answer fired the one turn");
 		assert.match(calls[0]!.join("\n"), /\\"label\\":\\"misconception\\"/, "the teacher's turn saw the verdict");
+	});
+
+	it("answering a check never starts an extraction run — only teacher prose does", async () => {
+		// The trigger is live for this test (it is skipped under NODE_ENV=test),
+		// the pipeline is a spy, and coverage lives in memory.
+		const coverage: CoverageEntry[] = [];
+		const graphStore = stores.graphStore;
+		stores.graphStore = { ...graphStore, readCoverage: () => [...coverage], appendCoverage: (e) => void coverage.push(e) };
+		const runs: string[] = [];
+		const realRun = extraction.runExtraction;
+		extraction.runExtraction = async (id: string) => {
+			runs.push(id);
+			return undefined as never;
+		};
+		const LONG = (word: string) => Array.from({ length: 5000 }, () => word).join(" "); // ≫ the 4096-token budget
+		const { engine } = scriptedTeacher(() => [
+			() => fauxAssistantMessage([fauxText("Short prose."), fauxToolCall("explain", GRADED_EXPLAIN, { id: "call-g" })], { stopReason: "toolUse" }),
+			() => fauxAssistantMessage([fauxText("OK.")]),
+			() => fauxAssistantMessage([fauxText(LONG("prose"))]),
+		]);
+		const chat = createConfiguredChat("Test: answers never trigger extraction");
+		createdChats.push(chat.id);
+		const tools = { explain: teachExplainToolFor({ chatId: chat.id, chatStore }) };
+		const factory: Parameters<typeof handleChatRequest>[1] = (opts) => createTeacherAgent(undefined, { engine, messages: opts.messages, tools });
+		const env = process.env.NODE_ENV;
+		try {
+			await drainTurn(post(chat.id, { type: "text", text: "teach me" }), factory);
+			// Everything so far is covered: only what the answer turn adds counts.
+			const foldedAt = new Date().toISOString();
+			for (const slot of coverageOf(chatStore.getChat(chat.id)!.messages, [], chat.id).slots) {
+				if (slot.tokens > 0) coverage.push({ chatId: chat.id, fp: slot.fp, tokens: slot.tokens, foldedAt });
+			}
+			(process.env as Record<string, string>).NODE_ENV = "development";
+			graderModelOverride.current = scriptedGrader([verdictCall(["present", "absent", "absent"])]).engine;
+			const pending = danglingQuestionOf(chatStore.getChat(chat.id)!.messages)!;
+			const qd = questionDataFor("explain", pending.toolCallId, parseExplainInput(pending.input)!, { now: new Date().toISOString() });
+			const answer = buildAnswer(qd, { text: LONG("answer"), thinking: LONG("thinking"), confidence: 70, confidenceTouched: true }, "explain");
+			await drainTurn(post(chat.id, { type: "answer", toolCallId: "call-g", answer }), factory);
+			assert.deepEqual(runs, [], "a long answer, its thinking and a short reaction open no run");
+
+			// The control: long teacher prose does reach the trigger.
+			await drainTurn(post(chat.id, { type: "text", text: "go on" }), factory);
+			assert.deepEqual(runs, [chat.id], "teacher prose over the budget starts a run");
+		} finally {
+			(process.env as Record<string, string | undefined>).NODE_ENV = env;
+			graderModelOverride.current = undefined;
+			extraction.runExtraction = realRun;
+			stores.graphStore = graphStore;
+		}
+	});
+
+	it("a duplicate submit of a deferred sibling answer, arriving while it is graded, never calls the grader twice", async () => {
+		const ASK = { question: "Which topic next?", options: [{ label: "Chemistry" }, { label: "History" }] };
+		const { engine } = scriptedTeacher(() => [
+			() =>
+				fauxAssistantMessage(
+					[fauxToolCall("explain", GRADED_EXPLAIN, { id: "call-g" }), fauxToolCall("ask_user_question", ASK, { id: "call-2" })],
+					{ stopReason: "toolUse" },
+				),
+		]);
+		const chat = createConfiguredChat("Test: duplicate deferred graded explain");
+		createdChats.push(chat.id);
+		const tools = { ...bareQuestionTools(), explain: teachExplainToolFor({ chatId: chat.id, chatStore }) };
+		const factory: Parameters<typeof handleChatRequest>[1] = (opts) => createTeacherAgent(undefined, { engine, messages: opts.messages, tools });
+		await drainTurn(post(chat.id, { type: "text", text: "two at once" }), factory);
+		const pending = danglingQuestionOf(chatStore.getChat(chat.id)!.messages)!;
+		const qd = questionDataFor("explain", pending.toolCallId, parseExplainInput(pending.input)!, { now: new Date().toISOString() });
+		const answer = buildAnswer(qd, { text: LEARNER_TEXT }, "explain");
+
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => (release = resolve));
+		let graderCalls = 0;
+		const grader = scriptedGrader([
+			(async () => {
+				graderCalls++;
+				await gate;
+				return fauxAssistantMessage([fauxToolCall("submit_verdict", verdictCall(["present", "present", "absent"]) as never)], { stopReason: "toolUse" });
+			}) as unknown as FauxResponseStep,
+			(() => {
+				graderCalls++;
+				return fauxAssistantMessage([fauxToolCall("submit_verdict", verdictCall(["absent", "absent", "absent"]) as never)], { stopReason: "toolUse" });
+			}) as unknown as FauxResponseStep,
+		]);
+		graderModelOverride.current = grader.engine;
+		try {
+			const first = handleChatRequest(post(chat.id, { type: "answer", toolCallId: "call-g", answer }), factory);
+			await waitFor(() => graderCalls === 1, 8000, "the first grade to start");
+			const duplicate = await handleChatRequest(post(chat.id, { type: "answer", toolCallId: "call-g", answer }), factory);
+			assert.equal(duplicate.status, 409, "the duplicate is refused while the first is graded");
+			release();
+			assert.equal((await first).status, 200);
+		} finally {
+			release();
+			graderModelOverride.current = undefined;
+		}
+		assert.equal(graderCalls, 1, "the grader ran once");
+		const results = chatStore.getChat(chat.id)!.messages.filter((m) => (m as { toolCallId?: string }).toolCallId === "call-g");
+		assert.equal(results.length, 1, "one answer saved");
+		assert.equal((results[0] as { details: Record<string, any> }).details.verdict?.points?.[0]?.status, "present");
 	});
 });
 
@@ -2261,7 +2400,7 @@ describe("recognition and prediction answers become answer entries (#10)", () =>
 		createdChats.push(chat.id);
 		await drainTurn(post(chat.id, { type: "text", text: "teach me the planets" }), agentFactory(engine));
 		const pending = danglingQuestionOf(chatStore.getChat(chat.id)!.messages)!;
-		const qd = questionDataFor("quiz", pending.toolCallId, parseQuizInput(pending.input)!);
+		const qd = questionDataFor("quiz", pending.toolCallId, parseQuizInput(pending.input)!, { now: new Date().toISOString() });
 		const answer = buildAnswer(qd, answerReq, "quiz");
 		tamper(answer);
 		await drainTurn(post(chat.id, { type: "answer", toolCallId: "call-1", answer }), agentFactory(engine));

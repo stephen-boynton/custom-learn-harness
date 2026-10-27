@@ -267,7 +267,14 @@ function QuestionDockForm({
 	// Canonical QuestionData, built once per question (questionDataFor,
 	// question-core: the deterministic shuffle, the commitment and its key
 	// points — the same pure seam the tests drive).
-	const qd = useMemo<QuestionData>(() => questionDataFor(kind, toolCallId, input), [toolCallId, kind, input]);
+	const qd = useMemo<QuestionData>(
+		() =>
+			questionDataFor(kind, toolCallId, input, {
+				now: new Date().toISOString(),
+				warn: (problem) => console.error("[quiz] correctAnswer did not resolve:", problem),
+			}),
+		[toolCallId, kind, input],
+	);
 
 	// The selection state machine lives in question-core (pure, tested):
 	// single-select displaces, multi-select coexists — picking the ask
