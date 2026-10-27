@@ -678,6 +678,31 @@ describe("graph ledger store", () => {
 		assert.equal(graphStore.readEvidence().length, 3, "malformed lines are skipped");
 	});
 
+	it("the graph's version stamp moves when only evidence changes — answers or attributions", () => {
+		graphStore.appendEvidence({ type: "attributionRun", toolCallId: "call-rev", runId: "run_rev", at: "2026-10-27T00:00:00.000Z" });
+		graphStore.appendEvidence({
+			type: "answer",
+			toolCallId: "call-rev",
+			chatId: "chat_c",
+			questionMessageId: "a1",
+			answerMessageId: "r1",
+			kind: "recognition",
+			phase: "teach",
+			dontKnow: false,
+			correct: true,
+			at: "2026-10-27T00:00:00.000Z",
+		});
+		// Stamp each evidence file in turn far past every other graph file:
+		// the revision must follow it.
+		for (const [file, seconds] of [
+			[LEDGER_FILES.evidence, 4_000_000_000],
+			[LEDGER_FILES.evidenceAnswers, 4_100_000_000],
+		] as const) {
+			fs.utimesSync(file, seconds, seconds);
+			assert.equal(graphRevision(), seconds * 1000, file);
+		}
+	});
+
 	it("the evidence ledger is split by writer: answers in evidence-answers.jsonl, attributions and runs in evidence.jsonl", () => {
 		const fileLines = (file: string) => (fs.existsSync(file) ? fs.readFileSync(file, "utf-8").split("\n").filter(Boolean) : []);
 		const before = { answers: fileLines(LEDGER_FILES.evidenceAnswers).length, attributions: fileLines(LEDGER_FILES.evidence).length };
