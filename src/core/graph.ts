@@ -170,7 +170,19 @@ export function mergeFindings(
 
 	// VERDICTS-ONLY (owner, 2026-09-28): the propositions come from the
 	// extractor's findings verbatim; the auditor's links join here by id.
+	// Targets stated only for attribution (#11) resolve here instead:
+	// linked → that node; unlinked (or linked to a vanished node) →
+	// dropped. They never create, link-append or anchor a chain — checks
+	// are attribution-only, the graph is built from teaching alone.
+	const attributionOnly = new Map<string, string>();
 	for (const p of findings.propositions) {
+		if (p.forAttributionOnly !== true) continue;
+		const linkTo = linkOf.get(p.id);
+		if (linkTo !== undefined && existingIds.has(linkTo) && !attributionOnly.has(p.id)) attributionOnly.set(p.id, linkTo);
+	}
+
+	for (const p of findings.propositions) {
+		if (p.forAttributionOnly === true) continue; // resolved above, never a node
 		if (mapping.has(p.id)) continue; // duplicate id WITHIN this submit — first resolution stands
 		// The anchor (2026-10-13): a session proposition may carry its
 		// passage's messageId — it rides BOTH the create and the link-append
@@ -278,12 +290,19 @@ export function mergeFindings(
 	// 2c. Attributions (spec #2, #9) — one evidence-ledger line per
 	//     (check, key point, proposition), each target resolved through
 	//     THIS job's map (a target the auditor linked to an existing node
-	//     lands on that node). Written BEFORE the checkpoint: a failure
-	//     leaves the batch uncovered, so it re-runs and attributes again.
+	//     lands on that node) or, like a chain endpoint, passed through
+	//     verbatim when it names an existing node (an earlier batch's idea
+	//     from THE GRAPH SO FAR, #11). Written BEFORE the checkpoint: a
+	//     failure leaves the batch uncovered, so it re-runs and attributes
+	//     again.
 	for (const attribution of findings.attributions ?? []) {
-		const targets = new Set(attribution.propositions.map((local) => mapping.get(local)));
+		const targets = new Set(
+			attribution.propositions.map(
+				(target) => mapping.get(target) ?? attributionOnly.get(target) ?? (existingIds.has(target) ? target : undefined),
+			),
+		);
 		for (const propositionId of targets) {
-			if (propositionId === undefined) continue; // not a proposition of this submission
+			if (propositionId === undefined) continue; // neither this submission's nor an existing node
 			ledgers.appendEvidence({
 				type: "attribution",
 				toolCallId: attribution.toolCallId,

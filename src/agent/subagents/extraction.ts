@@ -215,10 +215,23 @@ const sessionPropositionProps = {
 			"The message id of the ONE passage in this stretch that most directly states or explains this " +
 			'proposition — copy it EXACTLY from that passage\'s "TEACHER [id]" label.',
 	}),
+	// A TARGET STATED ONLY FOR ATTRIBUTION (#11, owner 2026-10-27 —
+	// wording drafted, pending owner review): exempt from the anchor law,
+	// never knowledge (the auditor links it or it is dropped).
+	forAttributionOnly: Type.Optional(
+		Type.Boolean({
+			description:
+				"true ONLY for an idea a check tests that this stretch does not teach and THE GRAPH SO FAR does not " +
+				"show — stated solely so the check can be attributed to it. It is never added to the graph: the " +
+				"linking stage matches it to an idea already there, or it is dropped. Omit it for every proposition " +
+				"this stretch teaches.",
+		}),
+	),
 };
 
 // ATTRIBUTION (spec #2, #9 — drafted, pending owner review): each check
-// in the stretch names the propositions of THIS submission it tested —
+// in the stretch names the propositions it tested (this submission's, or
+// an earlier batch's by id — #11) —
 // per key point for a free-recall check, as a whole for a multiple-choice
 // check or prediction (owner, 2026-10-27). Checks are addressed by their
 // batch-local alias (q1, …), never a raw toolCallId; the pipeline maps
@@ -236,13 +249,14 @@ const attributionSchema = Type.Object({
 	propositions: Type.Array(Type.String(), {
 		minItems: 1,
 		description:
-			"The ids of the propositions in THIS submission that this key point (or check) tests — only what a " +
-			"correct answer would itself show, never the premises behind it.",
+			"The ids of the propositions this key point (or check) tests — ids from THIS submission, or existing ids " +
+			"from THE GRAPH SO FAR, verbatim. Only what a correct answer would itself show, never the premises " +
+			"behind it.",
 	}),
 });
 
 const attributionsDescription =
-	"For each check in this stretch, the propositions of this submission it tests, judged from the question " +
+	"For each check in this stretch, the propositions it tests, judged from the question " +
 	"alone: one entry per key point of a free-recall check, one entry per multiple-choice check. Leave out a " +
 	"check or key point that tests none of them; pass [] when there are none — never omit the field.";
 
@@ -283,7 +297,7 @@ const auditSchema = Type.Object({
 					"The id of the EXISTING graph node this proposition IS — your identity verdict. EQUIVALENCE BIAS (2026-09-27): paraphrases, rewordings, and compressions of the same claim MERGE; only genuinely distinct propositions stay apart.",
 			}),
 		}),
-		{ description: "Identity verdicts — which findings propositions ARE existing graph nodes. A proposition absent from here = create a new node. Pass [] when none — never omit the field." },
+		{ description: "Identity verdicts — which findings propositions ARE existing graph nodes. A proposition absent from here = create a new node (one marked forAttributionOnly is dropped instead). Pass [] when none — never omit the field." },
 	),
 });
 
@@ -365,6 +379,7 @@ function validateFindingsChains(value: FindingsSubmit, existingIds: ReadonlySet<
  *  refused even when it is a real message id of this chat. */
 function validateSessionAnchors(value: SessionFindingsSubmit, batchIds: ReadonlySet<string>): string | null {
 	for (const p of value.propositions) {
+		if (p.forAttributionOnly === true) continue; // stated by no passage (#11) — not an anchor
 		if (p.messageId.trim().length === 0) {
 			return `propositions: "${p.id}" is missing its messageId — copy the message id from the brackets of the passage (TEACHER [id]) that most directly states or explains it.`;
 		}
@@ -378,9 +393,15 @@ function validateSessionAnchors(value: SessionFindingsSubmit, batchIds: Readonly
 /** The ATTRIBUTION law (#9): every attribution names a check of THIS
  *  stretch by its alias; a free-recall check is attributed per key point
  *  (an id it actually lists), a multiple-choice check as a whole (no key
- *  point); every target is a proposition of THIS submission. Refusals
- *  ride the error-back channel like the anchor law. */
-function validateAttributions(value: SessionFindingsSubmit, checks: ReadonlyArray<ViewCheck>): string | null {
+ *  point); every target is a proposition of THIS submission or (#11,
+ *  owner 2026-10-27) an existing node id — an idea from an earlier
+ *  batch, named verbatim from THE GRAPH SO FAR. Refusals ride the
+ *  error-back channel like the anchor law. */
+function validateAttributions(
+	value: SessionFindingsSubmit,
+	checks: ReadonlyArray<ViewCheck>,
+	existingIds: ReadonlySet<string>,
+): string | null {
 	const ids = new Set(value.propositions.map((p) => p.id));
 	const byAlias = new Map(checks.map((c) => [c.alias, c]));
 	for (const a of value.attributions) {
@@ -398,9 +419,9 @@ function validateAttributions(value: SessionFindingsSubmit, checks: ReadonlyArra
 		} else if (a.keyPoint !== undefined) {
 			return `attributions: check "${a.check}" is multiple choice — attribute it as a whole, without a keyPoint.`;
 		}
-		const unknown = a.propositions.find((id) => !ids.has(id));
+		const unknown = a.propositions.find((id) => !ids.has(id) && !existingIds.has(id));
 		if (unknown !== undefined) {
-			return `attributions: "${unknown}" is not a proposition id of this submission — attribute only to propositions you are submitting.`;
+			return `attributions: "${unknown}" is neither a proposition id of this submission nor an existing idea id from THE GRAPH SO FAR — attribute only to those.`;
 		}
 	}
 	return null;
@@ -470,10 +491,12 @@ export const SESSION_MESSAGE_ID_RULE =
  *  owner review): name the propositions each one tested, nothing more. */
 export const SESSION_CHECKS_RULE =
 	"Blocks labeled CHECK are questions the teacher posed to the learner, shown as posed, without the learner's " +
-	"answers. They are context only: never extract a proposition from a check, and messageId always names a " +
-	"TEACHER passage. Instead, attribute each check: for every key point of a free-recall check, and for every " +
-	"multiple-choice check as a whole, list the propositions of your submission it tests. Judge from the question " +
-	"alone, and name only what a correct answer would itself show — never the premises behind it.";
+	"answers. They are context only: never extract knowledge from a check, and a taught proposition's messageId " +
+	"always names a TEACHER passage. Instead, attribute each check: for every key point of a free-recall check, " +
+	"and for every multiple-choice check as a whole, list the propositions it tests — your own, or an idea " +
+	"already in THE GRAPH SO FAR by its id. If it tests an idea that neither holds, state that idea as a " +
+	"proposition marked forAttributionOnly. Judge from the question alone, and name only what a correct answer " +
+	"would itself show — never the premises behind it.";
 
 export const SESSION_PREAMBLE =
 	"You are the extraction stage of a learning application. You read one stretch of a source — a teaching " +
@@ -581,7 +604,7 @@ function runExtractor(
 		parameters: sessionFindingsSchema,
 		fill: fillFindings,
 		validate: (value) =>
-			validateSessionAnchors(value, batchIds) ?? validateFindingsChains(value, existingIds) ?? validateAttributions(value, checks),
+			validateSessionAnchors(value, batchIds) ?? validateFindingsChains(value, existingIds) ?? validateAttributions(value, checks, existingIds),
 		systemPrompt: EXTRACTOR_INSTRUCTIONS,
 		prompt,
 		engine,
@@ -654,6 +677,10 @@ IDENTITY — links, per proposition:
   statements are the same claim at different precision or from different angles, LINK them. Only genuinely distinct
   propositions — different claims about the world — stay apart. You are NOT guarding against wrong merges; you are
   hunting for right ones.
+
+STATED ONLY FOR ATTRIBUTION — a proposition marked "forAttributionOnly": true is not new knowledge: the extractor
+stated it only to name an idea a question tested. Link it exactly as above when an existing node states it. If none
+does, add nothing — it is dropped, never created.
 
 Your deliverable is ONLY the identity verdicts: "links". NEVER restate the propositions —
 the merger already has them. You NEVER create relations between propositions — they come from the
@@ -1070,6 +1097,8 @@ export function createExtractionPipeline(deps: ExtractionPipelineDeps): Extracti
 							name: p.name,
 							statement: p.statement,
 							aliases: p.aliases,
+							// Link-or-drop, never create (#11).
+							...(p.forAttributionOnly === true ? { forAttributionOnly: true } : {}),
 						})),
 					},
 					null,
