@@ -40,7 +40,7 @@ import {
 	resolveRoleSpec,
 } from "../core/settings-resolution.ts";
 import { modelsNotConfigured, providerKeyMissing as providerKeyMissingEnvelope, type ProviderKeyMissing } from "../core/settings.ts";
-import { beginTurn, endTurn } from "./turn-liveness.ts";
+import { beginGrading, beginTurn, endGrading, endTurn } from "./turn-liveness.ts";
 import { applyParkedDismissal } from "./dismissal-park.ts";
 import { registerTurn, rememberTurnFailure, unregisterTurn } from "./turn-runs.ts";
 import { persistTurn, triggerExtraction, TurnPersistenceError } from "./turn-service.ts";
@@ -316,7 +316,20 @@ export async function handleChatInput(
 			if (!beginTurn(chatId)) return turnInFlight();
 			turnBegun = true;
 		}
-		const graded = await withVerdict(chatId, record.messages, input.toolCallId, input.answer);
+		// A deferred sibling answer holds no turn: the grading guard keeps a
+		// concurrent duplicate from grading it twice. Released before the
+		// save below with no await between — the duplicate then finds the
+		// answer saved (400) instead of racing it.
+		if (!beginGrading(chatId, input.toolCallId)) {
+			if (turnBegun) endTurn(chatId);
+			return turnInFlight();
+		}
+		let graded;
+		try {
+			graded = await withVerdict(chatId, record.messages, input.toolCallId, input.answer);
+		} finally {
+			endGrading(chatId, input.toolCallId);
+		}
 		graderSpend = graded.spend;
 		input = { ...input, answer: graded.answer };
 		const fresh = stores.chatStore.getChat(chatId);

@@ -2278,6 +2278,56 @@ describe("the independent grader puts a verdict on each production answer", () =
 		assert.equal(calls.length, 1, "the last answer fired the one turn");
 		assert.match(calls[0]!.join("\n"), /\\"label\\":\\"misconception\\"/, "the teacher's turn saw the verdict");
 	});
+
+	it("a duplicate submit of a deferred sibling answer, arriving while it is graded, never calls the grader twice", async () => {
+		const ASK = { question: "Which topic next?", options: [{ label: "Chemistry" }, { label: "History" }] };
+		const { engine } = scriptedTeacher(() => [
+			() =>
+				fauxAssistantMessage(
+					[fauxToolCall("explain", GRADED_EXPLAIN, { id: "call-g" }), fauxToolCall("ask_user_question", ASK, { id: "call-2" })],
+					{ stopReason: "toolUse" },
+				),
+		]);
+		const chat = createConfiguredChat("Test: duplicate deferred graded explain");
+		createdChats.push(chat.id);
+		const tools = { ...bareQuestionTools(), explain: teachExplainToolFor({ chatId: chat.id, chatStore }) };
+		const factory: Parameters<typeof handleChatRequest>[1] = (opts) => createTeacherAgent(undefined, { engine, messages: opts.messages, tools });
+		await drainTurn(post(chat.id, { type: "text", text: "two at once" }), factory);
+		const pending = danglingQuestionOf(chatStore.getChat(chat.id)!.messages)!;
+		const qd = questionDataFor("explain", pending.toolCallId, parseExplainInput(pending.input)!);
+		const answer = buildAnswer(qd, { text: LEARNER_TEXT }, "explain");
+
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => (release = resolve));
+		let graderCalls = 0;
+		const grader = scriptedGrader([
+			(async () => {
+				graderCalls++;
+				await gate;
+				return fauxAssistantMessage([fauxToolCall("submit_verdict", verdictCall(["present", "present", "absent"]) as never)], { stopReason: "toolUse" });
+			}) as unknown as FauxResponseStep,
+			(() => {
+				graderCalls++;
+				return fauxAssistantMessage([fauxToolCall("submit_verdict", verdictCall(["absent", "absent", "absent"]) as never)], { stopReason: "toolUse" });
+			}) as unknown as FauxResponseStep,
+		]);
+		graderModelOverride.current = grader.engine;
+		try {
+			const first = handleChatRequest(post(chat.id, { type: "answer", toolCallId: "call-g", answer }), factory);
+			await waitFor(() => graderCalls === 1, 8000, "the first grade to start");
+			const duplicate = await handleChatRequest(post(chat.id, { type: "answer", toolCallId: "call-g", answer }), factory);
+			assert.equal(duplicate.status, 409, "the duplicate is refused while the first is graded");
+			release();
+			assert.equal((await first).status, 200);
+		} finally {
+			release();
+			graderModelOverride.current = undefined;
+		}
+		assert.equal(graderCalls, 1, "the grader ran once");
+		const results = chatStore.getChat(chat.id)!.messages.filter((m) => (m as { toolCallId?: string }).toolCallId === "call-g");
+		assert.equal(results.length, 1, "one answer saved");
+		assert.equal((results[0] as { details: Record<string, any> }).details.verdict?.points?.[0]?.status, "present");
+	});
 });
 
 // ─── recognition and prediction answers as evidence (#10) ──────────────────
