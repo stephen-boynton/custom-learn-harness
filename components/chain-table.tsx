@@ -599,6 +599,7 @@ export function ChainTableOverlay({
 	chains: storedChains,
 	sessions,
 	fileSources,
+	evidenceCount,
 	onClose,
 	/** PRACTICE SELECT (owner vision, 2026-10-04): the selection is
 	 *  PERSISTENT and caller-owned — when these props are present the
@@ -615,6 +616,10 @@ export function ChainTableOverlay({
 	chains: GraphChain[];
 	sessions: Record<string, string>;
 	fileSources: Record<string, string>;
+	/** nodeId → evidence count, off the graph snapshot (#12) — the delete
+	 *  dialog's evidence line. Absent ids (and an absent map, for a
+	 *  pick-only table that never deletes) read as 0. */
+	evidenceCount?: Record<string, number>;
 	onClose: () => void;
 	selectMode?: boolean;
 	controlledSelection?: ReadonlySet<string>;
@@ -711,7 +716,7 @@ export function ChainTableOverlay({
 			</div>
 			{deleteOpen && (
 				<DeleteNodeDialog
-					nodes={selectedNodes.map((n) => ({ id: n.id, name: n.name }))}
+					nodes={selectedNodes.map((n) => ({ id: n.id, name: n.name, evidenceCount: evidenceCount?.[n.id] ?? 0 }))}
 					onClose={() => setDeleteOpen(false)}
 					onDeleted={(deadIds, graphRevision) => {
 						// Close the dialog; prune the dead ids from the

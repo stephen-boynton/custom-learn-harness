@@ -19,6 +19,7 @@
 // ─── Knowledge graph (vision §1 — global, cross-session) ────────────────────
 
 import type { CallUsage, ExtractionRunUsage } from "./chat.ts";
+import type { Verdict } from "../verdict.ts";
 
 /** One relation of the DERIVED view — chains are the stored truth (owner,
  *  2026-09-30: "the graph is a lossy image of what is truly stored"), and
@@ -82,6 +83,15 @@ export interface ProvenancePoint {
 	messageId: string;
 }
 
+/** The prefix of every notes source id — the notes front door mints its
+ *  ids with it, and readers tell a notes source from a chat by it. */
+export const NOTES_SOURCE_ID_PREFIX = "src_";
+
+/** Is this provenance key a notes source (not a chat)? */
+export function isNotesSourceId(id: string): boolean {
+	return id.startsWith(NOTES_SOURCE_ID_PREFIX);
+}
+
 /** One imported notes file — the format-agnostic front door's bookkeeping
  *  (DECIDED 2026-09-13): personal notes in ARBITRARY formats run through the
  *  same extractor → auditor → merger pipeline, with the file itself as the
@@ -91,6 +101,8 @@ export interface ProvenancePoint {
  *  path — deterministic, so re-importing the same file re-runs extraction
  *  against the same source id (mappings dedupe by it). */
 export interface NotesSource {
+	/** NOTES_SOURCE_ID_PREFIX + the path hash (the notes front door,
+	 *  agent/subagents/extraction.ts importNotes, mints it). */
 	id: string;
 	filePath: string;
 	/** ISO — when this file was imported (the checkpoint's foldedAt). */
@@ -243,6 +255,14 @@ export interface ExtractedProposition {
 	 *  undefined → messageId "" (chat-level), so NO persisted shape or
 	 *  format version changes (GraphNode / ProvenancePoint untouched). */
 	messageId?: string;
+	/** SESSION PATH ONLY (#11, owner 2026-10-27): a TARGET STATED ONLY FOR
+	 *  ATTRIBUTION — an idea a check tests that this stretch does not
+	 *  teach and THE GRAPH SO FAR does not show. Never knowledge: the
+	 *  auditor links it to an existing node or it is dropped; the merger
+	 *  never creates, link-appends or chains it, and only attributions
+	 *  resolve through it. Its messageId is not an anchor (unchecked,
+	 *  unused). */
+	forAttributionOnly?: boolean;
 }
 
 /** One proposed argument (extractor redesign, 2026-09-30). Endpoints are
@@ -255,11 +275,110 @@ export interface ExtractedChain {
 	conclusion: string;
 }
 
-/** The extractor's output shape: the raw reasoning chains. */
+/** One attribution the extractor made (spec #2, #9): a check — or one
+ *  key point of a production check — and the propositions it tested,
+ *  judged from the question alone. The pipeline has already resolved the
+ *  view's batch-local alias ("q1") to the call's toolCallId; the
+ *  propositions are extractor-local ids of the SAME submission ("p1", …),
+ *  resolved to node ids by the merger. */
+export interface ExtractedAttribution {
+	toolCallId: string;
+	/** The key point id as the teacher authored it (production checks);
+	 *  absent for a recognition question or prediction (the whole check). */
+	keyPointId?: string;
+	propositions: string[];
+}
+
+/** The extractor's output shape: the raw reasoning chains, plus (session
+ *  door only, #9) the checks' attributions. */
 export interface SessionFindings {
 	propositions: ExtractedProposition[];
 	chains: ExtractedChain[];
+	/** Session door only; absent on notes findings (no checks there). */
+	attributions?: ExtractedAttribution[];
+	/** Session door only: the toolCallId of EVERY check travelling with
+	 *  the batch, attributed or not — the merger writes one run entry each
+	 *  (#11). */
+	checkedCalls?: string[];
 }
+
+// ─── The evidence ledger (spec #2, ADR-0002 — evidence.jsonl + evidence-answers.jsonl)
+//
+// Append-only, NEVER rewritten (not part of rewriteLedgers). Three kinds of
+// entry (answer, attribution, attribution run), all keyed by the question's
+// toolCallId; held is DERIVED on read
+// by joining them (core/evidence.ts), so an answer may land before or
+// after its question is extracted.
+
+/** What an answer is evidence OF (glossary): only production answers can
+ *  make a proposition held. */
+export type EvidenceKind = "production" | "recognition" | "prediction";
+
+/** Written when an answer is graded (production; an explain-predict is a
+ *  graded `prediction`) — by the chat handler, once, after the answer is
+ *  saved. */
+export interface AnswerEntry {
+	type: "answer";
+	toolCallId: string;
+	chatId: string;
+	/** The assistant message whose tool call posed the question. */
+	questionMessageId: string;
+	/** The toolResult message that carries the answer. */
+	answerMessageId: string;
+	kind: EvidenceKind;
+	phase: "probe" | "teach";
+	dontKnow: boolean;
+	/** The grader's verdict, as stored on the answer. Absent on "I don't
+	 *  know" (never graded). */
+	verdict?: Verdict;
+	/** Recognition and prediction only: MC correctness, recomputed SERVER
+	 *  side from the call's committed correct answer (owner, 2026-10-27) —
+	 *  false on "I don't know". */
+	correct?: boolean;
+	/** The learner's stated confidence (0-100), when sent. */
+	confidence?: number;
+	/** false = the slider was never moved (the resting value was submitted
+	 *  untouched) — mirrors QuestionAnswerData.confidenceTouched. */
+	confidenceTouched?: boolean;
+	/** The learner's thinking on the question, when any. */
+	thinking?: string;
+	/** ISO — when the entry was written. "Most recent evidence" orders by
+	 *  this (owner, 2026-10-27). */
+	at: string;
+}
+
+/** Written by the deterministic merger: one line per (check, key point,
+ *  proposition) the extractor attributed. */
+export interface AttributionEntry {
+	type: "attribution";
+	toolCallId: string;
+	/** Absent for a recognition question or prediction (the whole check). */
+	keyPointId?: string;
+	/** The graph node id the attribution resolved to. */
+	propositionId: string;
+	/** ISO — the merge that wrote it. */
+	at: string;
+	/** The merge that wrote it (#11, owner 2026-10-27): one id per merger
+	 *  write. Re-extraction attributes a check afresh; on read only the
+	 *  NEWEST run's attributions of a question count (core/evidence.ts). */
+	runId: string;
+}
+
+/** Written by the deterministic merger for EVERY check travelling with
+ *  the merged batch, attributed or not (#11, owner after #10–#12): it
+ *  marks that this run attributed the question afresh. On read the
+ *  newest run per question decides which attributions count, so a run
+ *  that links nothing leaves the check unattached. Counts and status
+ *  ignore the run entries themselves. */
+export interface AttributionRunEntry {
+	type: "attributionRun";
+	toolCallId: string;
+	runId: string;
+	/** ISO — the merge that wrote it. */
+	at: string;
+}
+
+export type EvidenceEntry = AnswerEntry | AttributionEntry | AttributionRunEntry;
 
 /** One identity verdict: the extractor's local proposition id → the
  *  EXISTING graph node that proposition IS. On link, the session's
@@ -340,6 +459,15 @@ export interface GraphSnapshot {
 	 * nodes are never partitioned. Purely provenance-derived — never
 	 * depends on layout. */
 	clusters: Cluster[];
+	/** nodeId → how many answers are attributed to the proposition (each
+	 *  answer once, latest attribution only — #11's newest-run rule
+	 *  applies). Propositions with none are absent: read `?? 0`. The delete
+	 *  dialog's count (#12) — on the snapshot so the dialog never fetches. */
+	evidenceCount: Record<string, number>;
+	/** How many answers are attributed to no proposition (glossary:
+	 *  unattached evidence) — the extractor-health measure. Not shown to
+	 *  the prober. */
+	unattachedEvidence: number;
 	/** Resting layout positions per node id, when a positions ledger
 	 *  exists (core/layout.ts settle writes it). Absent on a fresh graph —
 	 *  the view then falls back to its own one-shot forceAtlas2 pass. */

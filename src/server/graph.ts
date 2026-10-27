@@ -46,7 +46,7 @@ export function graphCosts(): GraphCostSummary {
 }
 
 /** The graph's version stamp (session-deletion wave 6): the max mtime
- * across every graph data file — ledgers, positions. Moves on ANY
+ * across every graph data file — ledgers (evidence included), positions. Moves on ANY
  * graph write (merge append, settle, or a deletion's atomic rewrite),
  * never moves on reads, and needs no bookkeeping of its own: the fs
  * IS the counter. Consumers poll it (the activity feed
@@ -59,6 +59,10 @@ export function graphRevision(): number {
 		LEDGER_FILES.chains,
 		LEDGER_FILES.sessions,
 		LEDGER_FILES.coverage,
+		// The evidence ledger (spec #2): the snapshot's evidenceCount and
+		// unattachedEvidence move with it, even when nothing else does.
+		LEDGER_FILES.evidence,
+		LEDGER_FILES.evidenceAnswers,
 		POSITIONS_FILE,
 	]) {
 		try {

@@ -34,6 +34,7 @@ import {
 	shuffleOptions,
 	type QuestionData,
 	toClientQuestion,
+	questionDataFor,
 } from "../src/core/question-core.ts";
 import { toolQuestionKind } from "../src/core/pending.ts";
 import { parseQuizInput } from "../src/core/tool-parts.ts";
@@ -484,7 +485,7 @@ describe("buildAnswer", () => {
 		assert.equal(buildAnswer(quizData(), { values: ["mercury"] }).confidence, undefined);
 	});
 
-	it("drops confidence on dontKnow and on non-quiz kinds", () => {
+	it("drops confidence on dontKnow and on ask (explain carries it since 2026-10-27)", () => {
 		assert.equal(buildAnswer(quizData(), { dontKnow: true, confidence: 70 }).confidence, undefined);
 		const ask = quizData({ kind: "ask", correctIndices: undefined, explanation: undefined });
 		assert.equal(buildAnswer(ask, { other: "x", confidence: 70 }).confidence, undefined);
@@ -533,6 +534,19 @@ describe("compactAnswerForModel", () => {
 		assert.ok(!raw.includes("Mercury orbits closest"), "no explanation");
 		assert.ok(!("correctIndices" in compact), "correct is the verdict; indices are the call's");
 		assert.ok(!("questionId" in compact), "questionId was the toolCallId restated");
+	});
+
+	it("confidence shows only when the learner moved the slider — an untouched one reads \"not given\"", () => {
+		const touched = buildAnswer(quizData(), { values: ["mercury"], confidence: 70, confidenceTouched: true });
+		assert.equal(compactAnswerForModel(touched).confidence, 70);
+		const untouched = buildAnswer(quizData(), { values: ["mercury"], confidence: 50, confidenceTouched: false });
+		assert.equal(compactAnswerForModel(untouched).confidence, "not given");
+		const explainQD: QuestionData = { id: "e1", kind: "explain", question: "Why?", mode: "text", options: [], createdAt: new Date().toISOString() };
+		const explainUntouched = buildAnswer(explainQD, { text: "It is near the Sun.", confidence: 50, confidenceTouched: false }, "explain");
+		assert.equal(compactAnswerForModel(explainUntouched).confidence, "not given");
+		// A record from before the flag existed: its confidence was always a real pick.
+		const legacy = buildAnswer(quizData(), { values: ["mercury"], confidence: 50 });
+		assert.equal(compactAnswerForModel(legacy).confidence, 50);
 	});
 
 	it("dontKnow: the gap flag stands alone — no verdict, no confidence", () => {
@@ -654,11 +668,13 @@ describe("dock selection (toggleOption / toggleOther)", () => {
 // ─── the explain tool: free-recall quizzing (owner 2026-09-27) ─────────────
 
 describe("explainInputBase / explainInputProblems (the commitment contract)", () => {
-	it("has ONE authoring field — no explanation remnant (owner ruling 2026-09-27)", () => {
+	it("has ONE committed answer — no explanation remnant — and its key points right after it", () => {
 		// The MC quiz's explanation/answer split was quiz baggage: free
-		// recall commits a single correctAnswer, reasoning included.
+		// recall commits a single correctAnswer, reasoning included (owner
+		// ruling 2026-09-27). The key points (spec #2) are distilled from
+		// it, so they follow it in authoring order (owner, 2026-10-27).
 		const keys = Object.keys(explainInputBase.properties);
-		assert.deepEqual(keys, ["question", "correctAnswer", "details"]);
+		assert.deepEqual(keys, ["question", "correctAnswer", "keyPoints", "details"]);
 	});
 
 	it("the teach object LEADS with the required pair (type, nodeId) — base fields follow", () => {
@@ -817,5 +833,37 @@ describe("the quiz role field (predict | check)", () => {
 	it("the display parse KEEPS the role: quizDisplayInputSchema retains type where the base strips it", () => {
 		const cleaned = Value.Clean(quizDisplayInputSchema, { ...valid }) as Record<string, unknown>;
 		assert.equal(cleaned.type, "check", "role survives the display parse (the dock gates collapse + labels on it)");
+	});
+});
+
+// ─── questionDataFor (pure: the clock and the log come from the caller) ────
+
+describe("questionDataFor", () => {
+	const QUIZ = { question: "Closest planet?", options: [{ label: "Venus" }, { label: "Mercury" }], correctAnswer: "Mercury" };
+
+	it("is pure: the same call, the same data — the creation time is the caller's", () => {
+		const first = questionDataFor("quiz", "call-pure", QUIZ as never, { now: "2026-10-27T00:00:00.000Z" });
+		const again = questionDataFor("quiz", "call-pure", QUIZ as never, { now: "2026-10-27T00:00:00.000Z" });
+		assert.deepEqual(first, again);
+		assert.equal(first.createdAt, "2026-10-27T00:00:00.000Z");
+	});
+
+	it("an unresolvable correct answer is reported to the caller, never logged by core", () => {
+		const problems: string[] = [];
+		const original = console.error;
+		let logged = 0;
+		console.error = () => void logged++;
+		try {
+			const qd = questionDataFor("quiz", "call-bad", { ...QUIZ, correctAnswer: "Pluto" } as never, {
+				now: "2026-10-27T00:00:00.000Z",
+				warn: (problem) => problems.push(problem),
+			});
+			assert.deepEqual(qd.correctIndices, []);
+		} finally {
+			console.error = original;
+		}
+		assert.equal(logged, 0);
+		assert.equal(problems.length, 1);
+		assert.match(problems[0]!, /Pluto/);
 	});
 });

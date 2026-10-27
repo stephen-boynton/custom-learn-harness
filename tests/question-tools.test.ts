@@ -361,6 +361,7 @@ describe("teachExplainToolFor: the explain variant validates nodeId like the qui
 	const validExplain = {
 		question: "Explain why the null result matters.",
 		correctAnswer: "It ruled out the aether — a stationary aether predicts a fringe shift, and none was seen.",
+		keyPoints: [{ id: "p1", text: "It ruled out a stationary aether.", kind: "fact", required: true }],
 		nodeId: "arith",
 		type: "check",
 	};
@@ -418,11 +419,13 @@ describe("the prober's explain: no nodeId field at all", () => {
 		const res = await boundaryParse(probeExplainTool, {
 			question: "Explain what a derivative measures.",
 			correctAnswer: "The instantaneous rate of change at a point — the limit the slopes converge to.",
+			keyPoints: [{ id: "p1", text: "A derivative is an instantaneous rate of change.", kind: "fact", required: true }],
 		});
 		assert.equal(res.success, true);
 		const empty = await boundaryParse(probeExplainTool, {
 			question: "q",
 			correctAnswer: " ",
+			keyPoints: [{ id: "p1", text: "x", kind: "fact", required: true }],
 		});
 		assert.equal(empty.success, false);
 	});
@@ -461,6 +464,8 @@ describe("tool descriptions carry mechanics only, no question-craft", () => {
 			["probe explain", probeExplainTool],
 		] as const) {
 			assert.ok(tool.description.includes("COMMITTED"), `${name} keeps the commitment rule`);
+			assert.ok(tool.description.includes("keyPoints"), `${name} states the key-point requirement`);
+			assert.ok(!/grade it strictly/.test(tool.description), `${name} no longer tells the model to self-grade`);
 			assert.ok(!tool.description.includes("near-miss"), `${name} drops the doctrine (now in the shared prompt)`);
 		}
 	});
@@ -471,5 +476,9 @@ describe("tool descriptions carry mechanics only, no question-craft", () => {
 		);
 		assert.ok(shared.includes("asymmetry"), "the option craft moved here, not deleted");
 		assert.ok(shared.includes("TRANSCRIBED SPEECH"), "the dictation-leniency note lives here");
+		// Spec #2 / ADR-0003: free recall is graded by an independent grader
+		// against the key points — the teacher no longer self-grades.
+		assert.ok(shared.includes("independent grader"), "the grader replaces self-grading");
+		assert.ok(!shared.includes("Grade his words strictly"), "the self-grading paragraph is gone");
 	});
 });

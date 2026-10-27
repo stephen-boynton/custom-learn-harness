@@ -4,12 +4,13 @@
 //    on the prober ONLY when the composition root passes a graphStore
 //    (the graphToolsEnabled gate lives server-side; absent store = closed
 //    gate — the factory must not reach for settings itself).
-// 2. OUTPUT: names only — the owner ruling bars statement text and session
-//    contents from the prober's view of the map.
+// 2. OUTPUT: names + held status only (#9) — the owner ruling bars
+//    statement text and session contents from the prober's view of the map.
 // 3. HONESTY: empty graph, unknown session id — the tools answer in
 //    their own voice, never throw, never guess.
 
 import assert from "node:assert/strict";
+import * as fs from "node:fs";
 import { describe, it } from "node:test";
 import { createProberTools } from "../src/agent/tools.ts";
 import { auditorGraphTools } from "../src/agent/tools/graph.ts";
@@ -45,6 +46,7 @@ function fakeStores(
 		readChains: () => chains,
 		readCheckpoints: () => [],
 		readCoverage: () => [],
+		readEvidence: () => [],
 		readSources: () => [],
 		readPositions: () => ({}),
 		writePositions: () => {},
@@ -147,28 +149,32 @@ describe("list_sessions", () => {
 });
 
 describe("list_propositions", () => {
-	it("names only — what the session covered (2026-09-27: no levels, no dating)", async () => {
+	it("names with their status — never the statement (no evidence yet: covered only, no date)", async () => {
 		const { chatStore, graphStore } = fakeStores([
 			node("n1", "Water cycle", [pt("c1")]),
 			node("n2", "Evaporation", [pt("c1")]),
 		]);
 		const tools = createProberTools({ ...baseCtx, chatStore, graphStore });
 		const out = (await tools.list_propositions!.execute!("tc", { session: "c1" })).details as string;
-		assert.match(out, /2 proposition\(s\) covered in this session:/);
-		assert.match(out, /- Water cycle/);
-		assert.match(out, /- Evaporation/);
-		// The owner ruling: no levels, no dating, never the statement text.
-		assert.ok(!out.includes("as of"));
-		assert.ok(!out.includes("solid"));
+		assert.match(out, /2 proposition\(s\) born in this session:/);
+		assert.match(out, /^- Water cycle — covered only$/m);
+		assert.match(out, /^- Evaporation — covered only$/m);
+		// The owner ruling: never the statement text.
 		assert.ok(!out.includes("statement of"));
 	});
 
-	it("no evaluation machinery at all — the covered list is the whole output", async () => {
-		const { chatStore, graphStore } = fakeStores([node("n1", "Water cycle", [pt("c1")])]);
+	it("covered is never called held: the descriptions say so", () => {
+		const { chatStore, graphStore } = fakeStores([]);
 		const tools = createProberTools({ ...baseCtx, chatStore, graphStore });
-		const out = (await tools.list_propositions!.execute!("tc", { session: "c1" })).details as string;
-		assert.match(out, /- Water cycle/);
-		assert.ok(!out.includes("never evaluated"));
+		assert.match(tools.list_propositions!.description, /held .*misconception.*not held.*covered only.*encountered only/s);
+		assert.match(tools.list_sessions!.description, /covered is not held/);
+		assert.match(tools.list_propositions!.description, /not held \([^)]*wrong multiple-choice answer[^)]*\)/, "not held names a wrong multiple-choice answer too");
+	});
+
+	it("the prober doctrine says to probe anything not held — no longer that covered strands need no re-probing", () => {
+		const doctrine = fs.readFileSync(new URL("../src/agent/prompts/prober/10-probe-doctrine.md", import.meta.url), "utf-8");
+		assert.match(doctrine, /Probe anything not held\./);
+		assert.doesNotMatch(doctrine, /needs no re-probing/);
 	});
 
 	it("an unknown session id — honest redirect, not a throw", async () => {

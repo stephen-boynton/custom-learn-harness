@@ -14,10 +14,7 @@ import {
 	CONFIDENCE_STOPS,
 	DEFAULT_CONFIDENCE_INDEX,
 	emptyDockSelection,
-	normalizeOptions,
-	resolveCorrect,
-	seededRandom,
-	shuffleOptions,
+	questionDataFor,
 	toolQuestionKind,
 	parseAskInput,
 	parseQuizInput,
@@ -267,56 +264,17 @@ function QuestionDockForm({
 }: Omit<QuestionDockProps, "expanded" | "onExpand" | "reveal">) {
 	const kind = toolQuestionKind(toolName);
 
-	// Canonical QuestionData, built once per question. Quiz options are
-	// deterministically shuffled (seeded by toolCallId) so position never leaks
-	// correctness AND server/client render the same order (hydration-safe);
-	// the display order is snapshotted into the answer record at submit time.
-	const qd = useMemo<QuestionData>(() => {
-		const quizInput = kind === "quiz" ? (input as QuizToolInput) : null;
-		const askInput = kind === "ask" ? (input as AskToolInput) : null;
-		const explainInput = kind === "explain" ? (input as ExplainToolInput) : null;
-		const multi = input instanceof Object && "multiSelect" in input ? input.multiSelect === true : false;
-		const mode: QuestionMode =
-			kind === "quiz"
-				? multi
-					? "multi-select"
-					: "single-select"
-				: askInput?.options?.length
-					? multi
-						? "multi-select"
-						: "single-select"
-						: "text";
-		const options = normalizeOptions(
-			(quizInput?.options ?? askInput?.options ?? []) as { label: string; value?: string }[],
-		);
-		const ordered = kind === "quiz" && options.length > 0 ? shuffleOptions(options, seededRandom(toolCallId)) : options;
-		const q: QuestionData = {
-			id: toolCallId,
-			kind,
-			// The role (owner 2026-10-03): predict questions gate by it in the
-			// view (never collapsed) and the answered card tucks the explanation.
-			questionType: kind === "quiz" ? normalizeQuizType((input as { type?: unknown }).type) : undefined,
-			question: input.question,
-			context: input.details,
-			mode,
-			options: ordered,
-			createdAt: new Date().toISOString(),
-		};
-		if (quizInput) {
-			const resolved = resolveCorrect(quizInput.correctAnswer, ordered);
-			if (resolved.error) console.error("[quiz] correctAnswer did not resolve:", resolved.error);
-			q.correctIndices = resolved.indices;
-			q.explanation = quizInput.explanation;
-		}
-		if (explainInput) {
-			// The commitment rides the question data (never sent to the
-			// client before answering) and snapshots into the answer at submit.
-			// One field, reasoning included — no separate explanation
-			// (owner ruling 2026-09-27).
-			q.committedAnswer = explainInput.correctAnswer;
-		}
-		return q;
-	}, [toolCallId, kind, input]);
+	// Canonical QuestionData, built once per question (questionDataFor,
+	// question-core: the deterministic shuffle, the commitment and its key
+	// points — the same pure seam the tests drive).
+	const qd = useMemo<QuestionData>(
+		() =>
+			questionDataFor(kind, toolCallId, input, {
+				now: new Date().toISOString(),
+				warn: (problem) => console.error("[quiz] correctAnswer did not resolve:", problem),
+			}),
+		[toolCallId, kind, input],
+	);
 
 	// The selection state machine lives in question-core (pure, tested):
 	// single-select displaces, multi-select coexists — picking the ask
@@ -334,10 +292,20 @@ function QuestionDockForm({
 	const thinkingTextRef = useRef(initialDraft?.thinking ?? "");
 	const answerTextRef = useRef(initialDraft?.text ?? "");
 	// Confidence (owner, 2026-10-01): an index into CONFIDENCE_STOPS,
-	// resting at 50 — a real coin flip by definition, untouched or
-	// deliberate (the same number, the same meaning). The dock unmounts
-	// between questions, so each question starts fresh at 50.
+	// resting at 50. Whether the learner ever moved it is recorded beside
+	// the value (owner, 2026-10-27 — reverses "50 must mean 50, never
+	// untouched"), so an untouched 50 is not read as a real coin flip.
+	// The dock unmounts between questions, so each starts fresh at 50.
 	const [confIdx, setConfIdx] = useState<number>(initialDraft?.confidenceIndex ?? DEFAULT_CONFIDENCE_INDEX);
+	const [confTouched, setConfTouched] = useState<boolean>(initialDraft?.confidenceTouched ?? false);
+	const moveConfidence = (next: number | ((i: number) => number)) => {
+		setConfIdx(next);
+		setConfTouched(true);
+	};
+	// Explain and recall carry the quiz's confidence slider and thinking
+	// field too (owner, 2026-10-27); ask never does.
+	const hasConfidence = kind === "quiz" || kind === "explain";
+	const hasThinking = qd.mode !== "text" || kind === "explain";
 	const selectMode: SelectMode = qd.mode === "multi-select" ? "multi-select" : "single-select";
 
 	// The PRIMARY dictation input (owner, STT round 1): while a question
@@ -375,8 +343,11 @@ function QuestionDockForm({
 			? text.trim().length > 0
 			: sel.dontKnow || (sel.otherSelected && other.trim().length > 0) || sel.selected.size > 0;
 
-	const submit = () => {
-		if (!canSubmit || compactionRunning) return;
+	// `dontKnowNow`: the free-text "I don't know" button (explain/recall,
+	// owner 2026-10-27) — it submits AT ONCE, needs no typed answer, and
+	// discards whatever was typed.
+	const submit = (dontKnowNow = false) => {
+		if ((!canSubmit && !dontKnowNow) || compactionRunning) return;
 		/* FINISH DICTATION FIRST (owner, 2026-10-01): Enter may arrive while
 		 * a run is live with reasoning still in Deepgram's hands. Stop the
 		 * run, let the last finals land in the target field, and only then
@@ -384,22 +355,24 @@ function QuestionDockForm({
 		 * forgotten stop. The field values below come from the REF mirrors
 		 * because the flush lands via setState after an await. */
 		if (!isDictationActive()) {
-			doSubmit();
+			doSubmit(dontKnowNow);
 			return;
 		}
-		void finishDictation().then(doSubmit);
+		void finishDictation().then(() => doSubmit(dontKnowNow));
 	};
-	const doSubmit = () => {
-		if (!canSubmit) return;
+	const doSubmit = (dontKnowNow = false) => {
+		if (!canSubmit && !dontKnowNow) return;
 		const req: AnswerRequest = {
-			dontKnow: sel.dontKnow,
+			dontKnow: dontKnowNow || sel.dontKnow,
 			values: [...sel.selected].map((i) => qd.options[i]!.value),
 			other: sel.otherSelected ? other : undefined,
-			text: qd.mode === "text" ? answerTextRef.current : undefined,
-			thinking: qd.mode !== "text" ? thinkingTextRef.current.trim() || undefined : undefined,
-			// Always sent on quiz answers (owner: 50 must mean 50, never
-			// "untouched"); buildAnswer drops it on "I don't know".
-			confidence: kind === "quiz" ? CONFIDENCE_STOPS[confIdx] : undefined,
+			text: qd.mode === "text" && !dontKnowNow ? answerTextRef.current : undefined,
+			thinking: hasThinking ? thinkingTextRef.current.trim() || undefined : undefined,
+			// Always sent on quiz and explain answers, with whether the
+			// slider was moved (owner, 2026-10-27); buildAnswer drops both
+			// on "I don't know".
+			confidence: hasConfidence ? CONFIDENCE_STOPS[confIdx] : undefined,
+			confidenceTouched: hasConfidence ? confTouched : undefined,
 		};
 		// Snapshot before optimistic submission unmounts the form. Ref values
 		// include the dictation finals that just landed, unlike stale closures.
@@ -409,6 +382,7 @@ function QuestionDockForm({
 			other,
 			text: answerTextRef.current,
 			confidenceIndex: confIdx,
+			confidenceTouched: confTouched,
 		});
 		onSubmit(buildAnswer(qd, req, toolName));
 	};
@@ -478,7 +452,9 @@ function QuestionDockForm({
 	};
 
 	useEffect(() => {
-		if (!active || rowCount === 0) return;
+		// Explain/recall have no rows but do have the slider: the listener
+		// lives for its global ←/→ (owner, 2026-10-27).
+		if (!active || (rowCount === 0 && !hasConfidence)) return;
 		const onKeyDown = (e: KeyboardEvent) => {
 			const t = e.target as HTMLElement | null;
 			// A TYPING field is where keys mean text (owner round 4): the
@@ -498,7 +474,8 @@ function QuestionDockForm({
 			// global ←/→ own its keyboard, so it never joins the chain.
 			// Shift+Tab falls through (the global thinking-level cycle owns
 			// it), so the shift check matters.
-			if (e.key === "Tab" && !e.shiftKey && !modded) {
+			// No rows (explain/recall): Tab keeps its native meaning.
+			if (rowCount > 0 && e.key === "Tab" && !e.shiftKey && !modded) {
 				e.preventDefault();
 				e.stopPropagation();
 				if (t?.closest?.("[data-kbdrow]")) thinkingRef.current?.focus();
@@ -513,6 +490,7 @@ function QuestionDockForm({
 			// the caret, space types).
 			if (typing || modded) return;
 			if (e.key === "ArrowDown") {
+				if (rowCount === 0) return;
 				e.preventDefault();
 				const next = Math.min((kbdIdx ?? -1) + 1, rowCount - 1);
 				setKbdIdx(next);
@@ -520,6 +498,7 @@ function QuestionDockForm({
 				// put them there) so focused and walked never diverge.
 				if (t?.closest?.("[data-kbdrow]")) focusRow(next);
 			} else if (e.key === "ArrowUp") {
+				if (rowCount === 0) return;
 				e.preventDefault();
 				const next = Math.max((kbdIdx ?? rowCount) - 1, 0);
 				setKbdIdx(next);
@@ -529,9 +508,9 @@ function QuestionDockForm({
 				// SAME pattern as ↑/↓ over the rows — works wherever focus
 				// sits, no click-in, no focus ring. Dead on "I don't know"
 				// (the slider grays out and nothing is sent).
-				if (kind !== "quiz" || sel.dontKnow) return;
+				if (!hasConfidence || sel.dontKnow) return;
 				e.preventDefault();
-				setConfIdx((i) =>
+				moveConfidence((i) =>
 					Math.min(
 						CONFIDENCE_STOPS.length - 1,
 						Math.max(0, i + (e.key === "ArrowRight" ? 1 : -1)),
@@ -752,8 +731,9 @@ function QuestionDockForm({
 				them). Keyboard: GLOBAL ←/→ (the ↑/↓ pattern; the ring is gone
 				app-wide). Clicking and dragging are native. "I don't know"
 				GRAYS it out — the layout holds, no value is sent, the IDK
-				signal stands alone. */}
-			{kind === "quiz" && (
+				signal stands alone. Explain and recall carry it too (owner,
+				2026-10-27), between the question and the answer box. */}
+			{hasConfidence && (
 				<div className="border-t border-border/60 px-4 py-2.5">
 					<div className="flex items-center gap-3">
 						<span
@@ -791,9 +771,9 @@ function QuestionDockForm({
 								step={1}
 								value={CONFIDENCE_STOPS[confIdx]}
 								disabled={sel.dontKnow}
-								aria-label="Confidence — the probability your selected answer is correct"
+								aria-label={`Confidence — the probability your ${kind === "quiz" ? "selected " : ""}answer is correct`}
 								aria-valuetext={`${CONFIDENCE_STOPS[confIdx]} percent`}
-								title="The probability your selected answer is correct — 50% is a coin flip. Adjust with ←/→."
+								title={`The probability your ${kind === "quiz" ? "selected " : ""}answer is correct — 50% is a coin flip. Adjust with ←/→.`}
 								data-testid="confidence-slider"
 								onChange={(e) => {
 									// Snap to the nearest stop; the rendered VALUE is the stop's own
@@ -806,7 +786,7 @@ function QuestionDockForm({
 									for (let i = 1; i < CONFIDENCE_STOPS.length; i++) {
 										if (Math.abs(CONFIDENCE_STOPS[i]! - v) < Math.abs(CONFIDENCE_STOPS[best]! - v)) best = i;
 									}
-									setConfIdx(best);
+									moveConfidence(best);
 								}}
 								style={{ color: CONFIDENCE_COLORS[confIdx] }}
 								className={cn(
@@ -850,7 +830,7 @@ function QuestionDockForm({
 					<div className="px-2.5 pt-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">
 						{qd.mode === "text" ? "Your answer" : "YOUR THINKING"}
 					</div>
-					{qd.mode === "text" ? (
+					{qd.mode === "text" && (
 						<textarea
 							value={text}
 							onChange={(e) => {
@@ -878,7 +858,17 @@ function QuestionDockForm({
 							rows={1}
 							className="field-sizing-content lh-input max-h-48 min-h-10 w-full resize-none bg-transparent px-2.5 py-2 outline-none placeholder:text-muted-foreground"
 						/>
-					) : (
+					)}
+					{/* Explain/recall gain the quiz's thinking field (owner,
+					    2026-10-27): beneath "Your answer" in the same box, with its
+					    own label — the answer stays the dictation target. */}
+					{hasThinking && (
+						<div data-testid={qd.mode === "text" ? "thinking-field" : undefined}>
+							{qd.mode === "text" && (
+								<div className="px-2.5 pt-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+									YOUR THINKING
+								</div>
+							)}
 						<textarea
 							ref={thinkingRef}
 							value={thinking}
@@ -913,15 +903,31 @@ function QuestionDockForm({
 								phase === "teach" ? "min-h-[4.5rem]" : "min-h-10",
 							)}
 						/>
+						</div>
 					)}
 					<div className="flex items-center justify-between gap-2 p-1">
 						<span aria-hidden className="pl-1.5 text-xs text-muted-foreground">
 								{compactionRunning ? "compacting session…" : "↵ submits · ⇧↵ newline"}
 						</span>
+						{/* Free-text "I don't know" (owner, 2026-10-27): explain and
+						    recall have no option rows, so the honest non-answer is a
+						    secondary button beside Submit — it submits at once and
+						    discards any typed text. */}
+						{kind === "explain" && (
+							<Button
+								type="button"
+								variant="outline"
+								disabled={compactionRunning}
+								onClick={() => submit(true)}
+								className="ml-auto h-9 rounded-[6px] px-3.5 text-sm font-medium"
+							>
+								I don't know
+							</Button>
+						)}
 						<Button
 							type="submit"
 							disabled={!canSubmit || compactionRunning}
-							className="ml-auto h-9 rounded-[6px] px-3.5 text-sm font-medium"
+							className={cn("h-9 rounded-[6px] px-3.5 text-sm font-medium", kind !== "explain" && "ml-auto")}
 						>
 							Submit answer
 						</Button>

@@ -67,6 +67,7 @@ import type {
 import { MIN_CLUSTER_SIZE } from "./clusters.ts";
 import { formatChainLine } from "./chains.ts";
 import { attachImpToCommunities, birthSessionOf, birthSessionPartition } from "./session-clusters.ts";
+import { evidenceView, type PropositionEvidence } from "./evidence.ts";
 import type { ChatStore, GraphStore } from "./ports.ts";
 
 /** The storage ports every graph operation needs, passed explicitly. */
@@ -169,7 +170,19 @@ export function mergeFindings(
 
 	// VERDICTS-ONLY (owner, 2026-09-28): the propositions come from the
 	// extractor's findings verbatim; the auditor's links join here by id.
+	// Targets stated only for attribution (#11) resolve here instead:
+	// linked → that node; unlinked (or linked to a vanished node) →
+	// dropped. They never create, link-append or anchor a chain — checks
+	// are attribution-only, the graph is built from teaching alone.
+	const attributionOnly = new Map<string, string>();
 	for (const p of findings.propositions) {
+		if (p.forAttributionOnly !== true) continue;
+		const linkTo = linkOf.get(p.id);
+		if (linkTo !== undefined && existingIds.has(linkTo) && !attributionOnly.has(p.id)) attributionOnly.set(p.id, linkTo);
+	}
+
+	for (const p of findings.propositions) {
+		if (p.forAttributionOnly === true) continue; // resolved above, never a node
 		if (mapping.has(p.id)) continue; // duplicate id WITHIN this submit — first resolution stands
 		// The anchor (2026-10-13): a session proposition may carry its
 		// passage's messageId — it rides BOTH the create and the link-append
@@ -272,6 +285,40 @@ export function mergeFindings(
 	if (keptChains.length !== allChains.length) {
 		ledgers.rewriteLedgers({ chains: keptChains });
 		stats.droppedChains = allChains.length - keptChains.length;
+	}
+
+	// 2c. Attributions (spec #2, #9) — one evidence-ledger line per
+	//     (check, key point, proposition), each target resolved through
+	//     THIS job's map (a target the auditor linked to an existing node
+	//     lands on that node) or, like a chain endpoint, passed through
+	//     verbatim when it names an existing node (an earlier batch's idea
+	//     from THE GRAPH SO FAR, #11). Written BEFORE the checkpoint: a
+	//     failure leaves the batch uncovered, so it re-runs and attributes
+	//     again. Every line carries THIS merge's run id: on read, a
+	//     question's newest run replaces its earlier ones (#11).
+	const runId = `run_${randomBytes(6).toString("hex")}`;
+	// The run entries first — one per check in the batch, attributed or
+	// not — so a run that links nothing still replaces the older ones.
+	for (const toolCallId of new Set(findings.checkedCalls ?? [])) {
+		ledgers.appendEvidence({ type: "attributionRun", toolCallId, runId, at: now });
+	}
+	for (const attribution of findings.attributions ?? []) {
+		const targets = new Set(
+			attribution.propositions.map(
+				(target) => mapping.get(target) ?? attributionOnly.get(target) ?? (existingIds.has(target) ? target : undefined),
+			),
+		);
+		for (const propositionId of targets) {
+			if (propositionId === undefined) continue; // neither this submission's nor an existing node
+			ledgers.appendEvidence({
+				type: "attribution",
+				toolCallId: attribution.toolCallId,
+				...(attribution.keyPointId !== undefined ? { keyPointId: attribution.keyPointId } : {}),
+				propositionId,
+				at: now,
+				runId,
+			});
+		}
 	}
 
 	// 3. Checkpoint — THE COVERAGE DISCIPLINE (vision-extraction-coverage.md):
@@ -583,6 +630,16 @@ export function graphSnapshot(deps: GraphDeps): GraphSnapshot {
 	// one-shot pass until the first merge writes the ledger.
 	const positions = deps.graphStore.readPositions();
 
+	// EVIDENCE COUNTS (#12, owner 2026-10-27): carried on the snapshot so
+	// the delete dialog shows them with NO fetch. Live propositions only —
+	// evidence on a deleted node is orphaned and counted nowhere.
+	const evidence = evidenceView(deps.graphStore.readEvidence());
+	const evidenceCount: Record<string, number> = {};
+	for (const node of graph.nodes) {
+		const n = evidence.answerCountOf(node.id);
+		if (n > 0) evidenceCount[node.id] = n;
+	}
+
 	return {
 		nodes,
 		propositions: graph.nodes,
@@ -594,6 +651,8 @@ export function graphSnapshot(deps: GraphDeps): GraphSnapshot {
 		fileSources,
 		nodeSessions,
 		clusters,
+		evidenceCount,
+		unattachedEvidence: evidence.unattached.length,
 		...(Object.keys(positions).length > 0 ? { positions } : {}),
 	};
 }
@@ -681,6 +740,21 @@ export function graphSessionPropositions(deps: GraphDeps, sessionId: string): Gr
 	const born = getGraph(deps.graphStore).nodes.filter((node) => birthSessionOf(node) === sessionId);
 	return born
 		.map((node) => ({ nodeId: node.id, name: node.name }))
+		.sort((a, b) => (a.nodeId < b.nodeId ? -1 : 1));
+}
+
+/** A birth proposition with its held status (spec #2, #9) — the prober's
+ *  view: derived from the evidence ledger on read, never stored. */
+export interface GraphSessionPropositionStatus extends GraphSessionProposition, PropositionEvidence {}
+
+/** The propositions BORN in one session, each with its status and the
+ *  timestamp of the evidence that decided it. Same order as
+ *  graphSessionPropositions. */
+export function graphSessionStatuses(deps: GraphDeps, sessionId: string): GraphSessionPropositionStatus[] {
+	const evidence = evidenceView(deps.graphStore.readEvidence());
+	const born = getGraph(deps.graphStore).nodes.filter((node) => birthSessionOf(node) === sessionId);
+	return born
+		.map((node) => ({ nodeId: node.id, name: node.name, ...evidence.statusOf(node) }))
 		.sort((a, b) => (a.nodeId < b.nodeId ? -1 : 1));
 }
 

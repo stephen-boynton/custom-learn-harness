@@ -11,7 +11,7 @@
   <a href="https://github.com/stephen-boynton/custom-learn-harness/issues">Issues</a>
 </p>
 
-Custom Learn Harness uses AI agents to plan and teach lessons from your current understanding to your goal. It builds a detailed picture of what you understand and how you reason. That picture is updated as you learn.
+Custom Learn Harness uses AI agents to plan and teach lessons from your current understanding to your goal. It keeps track of which ideas your sessions have covered and, separately, which ones your own answers have shown you hold. That record is updated as you learn.
 
 Instead of just giving you an explanation, it uses your answers and thinking to decide what you need next. Teaching builds understanding one reasoning step at a time. Practice makes it usable. A persistent knowledge graph carries it across sessions.
 

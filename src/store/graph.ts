@@ -13,6 +13,13 @@
  *                                      another line; readers merge)
  *   sessions.jsonl  SessionCheckpoint— emission checkpoints (foldedAt)
  *   coverage.jsonl  CoverageEntry    — per-message extraction coverage
+ *   evidence.jsonl  EvidenceEntry    — the evidence ledger (spec #2), split
+ *   evidence-answers.jsonl             by writer: answer entries (chat
+ *                                      handler) in evidence-answers.jsonl,
+ *                                      attribution + attribution-run
+ *                                      entries (merger) in evidence.jsonl.
+ *                                      NEVER rewritten (no rewriteLedgers
+ *                                      key)
  *
  * CHAINS-PRIMARY (owner, 2026-09-30): there is NO edges ledger — the edge
  * view (implication nodes + untyped arrows) is derived in core/graph.ts on
@@ -44,6 +51,7 @@ import type {
 	Position,
 	ProvenancePoint,
 	CoverageEntry,
+	EvidenceEntry,
 	SessionCheckpoint,
 } from "../core/contracts.ts";
 import type { GraphStore } from "../core/ports.ts";
@@ -126,6 +134,32 @@ const isCheckpoint = (v: unknown): v is SessionCheckpoint =>
 const isCoverageEntry = (v: unknown): v is CoverageEntry =>
 	isRecord(v) && isString(v.chatId) && isString(v.fp) && typeof v.tokens === "number" && isString(v.foldedAt);
 
+const EVIDENCE_KINDS = new Set(["production", "recognition", "prediction"]);
+const EVIDENCE_PHASES = new Set(["probe", "teach"]);
+
+/** An evidence line (spec #2): an answer or an attribution, keyed by the
+ *  question's toolCallId. The verdict's inner shape is the grader's,
+ *  validated before it was ever saved — the guard checks it is an object. */
+const isEvidenceEntry = (v: unknown): v is EvidenceEntry => {
+	if (!isRecord(v) || !isString(v.toolCallId) || !isString(v.at)) return false;
+	if (v.type === "attributionRun") return isString(v.runId);
+	if (v.type === "attribution") {
+		return isString(v.propositionId) && isString(v.runId) && (v.keyPointId === undefined || isString(v.keyPointId));
+	}
+	return (
+		v.type === "answer" &&
+		isString(v.chatId) &&
+		isString(v.questionMessageId) &&
+		isString(v.answerMessageId) &&
+		isString(v.kind) &&
+		EVIDENCE_KINDS.has(v.kind) &&
+		isString(v.phase) &&
+		EVIDENCE_PHASES.has(v.phase) &&
+		typeof v.dontKnow === "boolean" &&
+		(v.verdict === undefined || isRecord(v.verdict))
+	);
+};
+
 // ─── the port implementation ────────────────────────────────────────────────
 
 export const graphStore: GraphStore = {
@@ -160,6 +194,21 @@ export const graphStore: GraphStore = {
 	},
 	readCoverage(): CoverageEntry[] {
 		return readValid(LEDGER_FILES.coverage, isCoverageEntry);
+	},
+
+	/** The evidence ledger — append-only, never rewritten (no
+	 *  rewriteLedgers key), one file per writer: answers (the chat
+	 *  handler) apart from attributions and runs (the merger). */
+	appendEvidence(entry: EvidenceEntry): void {
+		appendLine(entry.type === "answer" ? LEDGER_FILES.evidenceAnswers : LEDGER_FILES.evidence, entry);
+	},
+	/** Answers first, then attributions and runs — each file in append
+	 *  order (the derivation needs order only within an entry kind). */
+	readEvidence(): EvidenceEntry[] {
+		return [
+			...readValid(LEDGER_FILES.evidenceAnswers, isEvidenceEntry).filter((e) => e.type === "answer"),
+			...readValid(LEDGER_FILES.evidence, isEvidenceEntry).filter((e) => e.type !== "answer"),
+		];
 	},
 
 	// ── imported-notes bookkeeping (config.SOURCES_FILE — a JSON map) ──

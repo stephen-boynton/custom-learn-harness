@@ -23,11 +23,13 @@ import type {
 	ExtractionStageUsage,
 	SessionFindings,
 } from "../../core/contracts.ts";
+import { callUsage, NOTES_SOURCE_ID_PREFIX } from "../../core/contracts.ts";
 import { getGraph, mergeFindings, type DerivedGraph, type EmissionStats, type GraphDeps } from "../../core/graph.ts";
 import type { GraphStore } from "../../core/ports.ts";
 import { emit } from "../../core/events.ts";
 import { settleGraphLayout } from "../../core/layout-settle.ts";
-import { batchRuns, coverageOf, messageViewLines } from "../../core/coverage.ts";
+import { batchRuns, coverageOf, coverageSlots, messageViewLines } from "../../core/coverage.ts";
+import { extractionViewOf, type ViewCheck } from "../../core/check-view.ts";
 import { failedOutputCallIds, type LhMessage } from "../../core/native-messages.ts";
 import { auditorGraphTools } from "../tools/graph.ts";
 import { runSubmitAgent, healStringifiedArrays } from "./submit-agent.ts";
@@ -107,37 +109,32 @@ import { runSubmitAgent, healStringifiedArrays } from "./submit-agent.ts";
 // ─── the source view (what the extractor sees) ──────────────────────────────
 
 /**
- * The extraction view: the session as TEACHER PROSE ONLY (owner ruling,
+ * The extraction view: the session as the TEACHER'S PROSE (owner ruling,
  * 2026-09-28 — supersedes the 2026-09-27 whole-session markdown view),
- * each passage labeled with its actual message id (2026-10-13). The
- * shared markdown engine (core/session-markdown.ts) keeps the full session
- * format for the future user-facing export; the extractor no longer uses
- * it.
+ * each passage labeled with its actual message id (2026-10-13), plus the
+ * checks the teacher posed, as posed (ADR-0004 — partly reverses the
+ * 2026-09-28 ruling): context outside coverage, rendered by
+ * core/check-view.ts. No learner messages, thinking, results or other
+ * tool calls. The shared markdown engine (core/session-markdown.ts) keeps
+ * the full session format for the future user-facing export; the
+ * extractor does not use it.
  */
 
 /** The whole-record view (used by callers that render a full session;
- *  the pipeline itself batches). TEACHER PROSE ONLY (owner, 2026-09-28),
- *  passages labeled with their message ids (2026-10-13).
- */
+ *  the pipeline itself batches): every prose passage, and every posed
+ *  check that has a prose message at or after it to travel with. */
 export function transcriptView(record: ChatRecord): string {
-	return proseView(record.messages, record.title);
+	const slots = coverageSlots(record.messages);
+	const { viewOf } = extractionViewOf(record.messages, slots);
+	return renderView(viewOf(slots.filter((slot) => slot.tokens > 0)).lines, record.title);
 }
 
-/** The extraction view under the teacher-prose ruling (owner, 2026-09-28):
- *  ONLY learner-facing teacher prose (text or send_to_user) — no learner
- *  messages, thinking, other tool calls/results, or quiz blocks — labeled with
- *  its ACTUAL message id (owner, 2026-10-13): the view lines ARE
- *  core/coverage.ts messageViewLines ("TEACHER [id] text"), the exact
- *  lines the coverage fingerprints hash, so the extractor can anchor
- *  every proposition to the passage it came from (the session submit's
- *  required messageId). The shared markdown engine stays reserved for the
- *  future user-facing export. */
-function proseView(
-	messages: ReadonlyArray<LhMessage>,
-	title?: string,
-	failedOutputCalls: ReadonlySet<string> = failedOutputCallIds(messages),
-): string {
-	const lines = messages.flatMap((message) => messageViewLines(message, message.id, failedOutputCalls));
+/** The prompt document: the session title, then the view's passages and
+ *  check blocks separated by blank lines. The TEACHER [id] lines are
+ *  core/coverage.ts messageViewLines verbatim — the lines the coverage
+ *  fingerprints hash — so the extractor anchors every proposition to the
+ *  passage it came from (the session submit's required messageId). */
+function renderView(lines: ReadonlyArray<string>, title?: string): string {
 	const head = title && title.length > 0 ? `# ${title}\n\n` : "";
 	return head + lines.join("\n\n");
 }
@@ -219,7 +216,50 @@ const sessionPropositionProps = {
 			"The message id of the ONE passage in this stretch that most directly states or explains this " +
 			'proposition — copy it EXACTLY from that passage\'s "TEACHER [id]" label.',
 	}),
+	// A TARGET STATED ONLY FOR ATTRIBUTION (#11, owner 2026-10-27 —
+	// wording drafted, pending owner review): exempt from the anchor law,
+	// never knowledge (the auditor links it or it is dropped).
+	forAttributionOnly: Type.Optional(
+		Type.Boolean({
+			description:
+				"true ONLY for an idea a check tests that this stretch does not teach and THE GRAPH SO FAR does not " +
+				"show — stated solely so the check can be attributed to it. It is never added to the graph: the " +
+				"linking stage matches it to an idea already there, or it is dropped. Omit it for every proposition " +
+				"this stretch teaches.",
+		}),
+	),
 };
+
+// ATTRIBUTION (spec #2, #9 — drafted, pending owner review): each check
+// in the stretch names the propositions it tested (this submission's, or
+// an earlier batch's by id — #11) —
+// per key point for a free-recall check, as a whole for a multiple-choice
+// check or prediction (owner, 2026-10-27). Checks are addressed by their
+// batch-local alias (q1, …), never a raw toolCallId; the pipeline maps
+// the alias back (core/check-view.ts).
+const attributionSchema = Type.Object({
+	check: Type.String({ description: 'The check\'s label, copied from its "CHECK q…" line (e.g. "q1").' }),
+	keyPoint: Type.Optional(
+		Type.String({
+			description:
+				'Free-recall checks only: the id of ONE key point listed under the check, without the check label ' +
+				'(for "q1.p2", "p2"). Omit it for a ' +
+				"multiple-choice check, which is attributed as a whole.",
+		}),
+	),
+	propositions: Type.Array(Type.String(), {
+		minItems: 1,
+		description:
+			"The ids of the propositions this key point (or check) tests — ids from THIS submission, or existing ids " +
+			"from THE GRAPH SO FAR, verbatim. Only what a correct answer would itself show, never the premises " +
+			"behind it.",
+	}),
+});
+
+const attributionsDescription =
+	"For each check in this stretch, the propositions it tests, judged from the question " +
+	"alone: one entry per key point of a free-recall check, one entry per multiple-choice check. Leave out a " +
+	"check or key point that tests none of them; pass [] when there are none — never omit the field.";
 
 const sessionFindingsSchema = Type.Object({
 	propositions: Type.Array(Type.Object(sessionPropositionProps), {
@@ -227,6 +267,9 @@ const sessionFindingsSchema = Type.Object({
 	}),
 	chains: Type.Array(chainSchema, {
 		description: chainsDescription,
+	}),
+	attributions: Type.Array(attributionSchema, {
+		description: attributionsDescription,
 	}),
 });
 
@@ -255,7 +298,7 @@ const auditSchema = Type.Object({
 					"The id of the EXISTING graph node this proposition IS — your identity verdict. EQUIVALENCE BIAS (2026-09-27): paraphrases, rewordings, and compressions of the same claim MERGE; only genuinely distinct propositions stay apart.",
 			}),
 		}),
-		{ description: "Identity verdicts — which findings propositions ARE existing graph nodes. A proposition absent from here = create a new node. Pass [] when none — never omit the field." },
+		{ description: "Identity verdicts — which findings propositions ARE existing graph nodes. A proposition absent from here = create a new node (one marked forAttributionOnly is dropped instead). Pass [] when none — never omit the field." },
 	),
 });
 
@@ -337,6 +380,7 @@ function validateFindingsChains(value: FindingsSubmit, existingIds: ReadonlySet<
  *  refused even when it is a real message id of this chat. */
 function validateSessionAnchors(value: SessionFindingsSubmit, batchIds: ReadonlySet<string>): string | null {
 	for (const p of value.propositions) {
+		if (p.forAttributionOnly === true) continue; // stated by no passage (#11) — not an anchor
 		if (p.messageId.trim().length === 0) {
 			return `propositions: "${p.id}" is missing its messageId — copy the message id from the brackets of the passage (TEACHER [id]) that most directly states or explains it.`;
 		}
@@ -345,6 +389,59 @@ function validateSessionAnchors(value: SessionFindingsSubmit, batchIds: Readonly
 		}
 	}
 	return null;
+}
+
+/** The ATTRIBUTION law (#9): every attribution names a check of THIS
+ *  stretch by its alias; a free-recall check is attributed per key point
+ *  (an id it actually lists), a multiple-choice check as a whole (no key
+ *  point); every target is a proposition of THIS submission or (#11,
+ *  owner 2026-10-27) an existing node id — an idea from an earlier
+ *  batch, named verbatim from THE GRAPH SO FAR. Refusals ride the
+ *  error-back channel like the anchor law. */
+function validateAttributions(
+	value: SessionFindingsSubmit,
+	checks: ReadonlyArray<ViewCheck>,
+	existingIds: ReadonlySet<string>,
+): string | null {
+	const ids = new Set(value.propositions.map((p) => p.id));
+	const byAlias = new Map(checks.map((c) => [c.alias, c]));
+	for (const a of value.attributions) {
+		const check = byAlias.get(a.check);
+		if (!check) {
+			return `attributions: "${a.check}" is not a check of THIS stretch — copy the label from one of its "CHECK q…" lines.`;
+		}
+		if (check.keyPointIds.length > 0) {
+			if (a.keyPoint === undefined) {
+				return `attributions: check "${a.check}" is free recall — attribute it per key point (${check.keyPointIds.join(", ")}), one entry each.`;
+			}
+			if (!check.keyPointIds.includes(a.keyPoint)) {
+				return `attributions: check "${a.check}" has no key point "${a.keyPoint}" — use one of ${check.keyPointIds.join(", ")}.`;
+			}
+		} else if (a.keyPoint !== undefined) {
+			return `attributions: check "${a.check}" is multiple choice — attribute it as a whole, without a keyPoint.`;
+		}
+		const unknown = a.propositions.find((id) => !ids.has(id) && !existingIds.has(id));
+		if (unknown !== undefined) {
+			return `attributions: "${unknown}" is neither a proposition id of this submission nor an existing idea id from THE GRAPH SO FAR — attribute only to those.`;
+		}
+	}
+	return null;
+}
+
+/** The session lift (#9): attributions leave the wire with their check
+ *  alias resolved to the call's toolCallId — downstream never sees an
+ *  alias. Validation already guaranteed every alias resolves. */
+function withAttributions(findings: SessionFindings, raw: SessionFindingsSubmit, checks: ReadonlyArray<ViewCheck>): SessionFindings {
+	const byAlias = new Map(checks.map((c) => [c.alias, c.toolCallId]));
+	return {
+		...findings,
+		checkedCalls: checks.map((c) => c.toolCallId),
+		attributions: raw.attributions.flatMap((a) => {
+			const toolCallId = byAlias.get(a.check);
+			if (toolCallId === undefined) return [];
+			return [{ toolCallId, ...(a.keyPoint !== undefined ? { keyPointId: a.keyPoint } : {}), propositions: [...a.propositions] }];
+		}),
+	};
 }
 
 /** (chains-primary, owner 2026-09-30) the wire IS the pipeline shape
@@ -388,10 +485,26 @@ function fillAudit(raw: Static<typeof auditSchema>): AuditVerdicts {
 export const SESSION_MESSAGE_ID_RULE =
 	"For each new proposition, copy the message ID of the passage that most directly states or explains it into messageId.";
 
+/** The session-only checks rule (ADR-0004, #8 — drafted, pending owner
+ *  review): CHECK blocks (core/check-view.ts) are context, never a
+ *  source — the graph is still built from teaching alone, and anchors
+ *  still name TEACHER passages (validateSessionAnchors). What the
+ *  extractor does WITH a check is ATTRIBUTION (#9 — drafted, pending
+ *  owner review): name the propositions each one tested, nothing more. */
+export const SESSION_CHECKS_RULE =
+	"Blocks labeled CHECK are questions the teacher posed to the learner, shown as posed, without the learner's " +
+	"answers. They are context only: never extract knowledge from a check, and a taught proposition's messageId " +
+	"always names a TEACHER passage. Instead, attribute each check: for every key point of a free-recall check, " +
+	"and for every multiple-choice check as a whole, list the propositions it tests — your own, or an idea " +
+	"already in THE GRAPH SO FAR by its id. If it tests an idea that neither holds, state that idea as a " +
+	"proposition marked forAttributionOnly. Judge from the question alone, and name only what a correct answer " +
+	"would itself show — never the premises behind it.";
+
 export const SESSION_PREAMBLE =
 	"You are the extraction stage of a learning application. You read one stretch of a source — a teaching " +
-	"session, rendered as the teacher's prose in reading order — and report what it teaches as findings " +
-	"for the learner's global knowledge graph, building on everything already extracted from this source.";
+	"session, rendered as the teacher's prose and the checks the teacher posed, in reading order — and report " +
+	"what it teaches as findings for the learner's global knowledge graph, building on everything already " +
+	"extracted from this source.";
 
 export const NOTES_PREAMBLE =
 	"You are the extraction stage of a learning application. You read one stretch of a source — the " +
@@ -432,7 +545,7 @@ reappear, by id, as a premise of later chains. A bare idea that no argument uses
 propositions list alone. Include every field even when empty — "chains": [] when the source makes no
 arguments. The tool's field descriptions carry the details.`;
 
-export const EXTRACTOR_INSTRUCTIONS = `${SESSION_PREAMBLE}\n\n${EXTRACTION_CORE}\n\n${SESSION_MESSAGE_ID_RULE}`;
+export const EXTRACTOR_INSTRUCTIONS = `${SESSION_PREAMBLE}\n\n${EXTRACTION_CORE}\n\n${SESSION_MESSAGE_ID_RULE}\n\n${SESSION_CHECKS_RULE}`;
 export const NOTES_EXTRACTOR_INSTRUCTIONS = `${NOTES_PREAMBLE}\n\n${EXTRACTION_CORE}`;
 
 // ── the same-source digest (owner, 2026-09-30 evening) ──
@@ -466,13 +579,16 @@ export function sourceDigest(graph: DerivedGraph, sourceId: string): string {
 /** The extractor over ONE session transcript (the chat front door).
  *  `batchIds` — the CURRENT batch's teacher-prose message ids — is the
  *  anchor boundary: every submitted proposition's messageId must name
- *  one of them (validateSessionAnchors at the submit seam). */
+ *  one of them (validateSessionAnchors at the submit seam). `checks` —
+ *  the checks travelling with the batch — is the attribution boundary
+ *  (validateAttributions) and the alias → toolCallId map. */
 function runExtractor(
 	engine: PiEngine | undefined,
 	sourceId: string,
 	prompt: string,
 	existingIds: ReadonlySet<string>,
 	batchIds: ReadonlySet<string>,
+	checks: ReadonlyArray<ViewCheck>,
 	signal: AbortSignal | undefined,
 	onStep: (usage: Usage, model: string, step: number, finishReason: string, tools: string) => void,
 ): Promise<SessionFindings> {
@@ -489,7 +605,8 @@ function runExtractor(
 		toolDescription: "Submit the session findings.",
 		parameters: sessionFindingsSchema,
 		fill: fillFindings,
-		validate: (value) => validateSessionAnchors(value, batchIds) ?? validateFindingsChains(value, existingIds),
+		validate: (value) =>
+			validateSessionAnchors(value, batchIds) ?? validateFindingsChains(value, existingIds) ?? validateAttributions(value, checks, existingIds),
 		systemPrompt: EXTRACTOR_INSTRUCTIONS,
 		prompt,
 		engine,
@@ -497,7 +614,7 @@ function runExtractor(
 		onStep,
 		neverSubmitted: "the extractor never submitted findings",
 		prepareArguments: healStringifiedArrays,
-	}).then(asSessionFindings);
+	}).then((raw) => withAttributions(asSessionFindings(raw), raw, checks));
 }
 
 /** The extractor over ONE source of raw personal notes (the format-agnostic
@@ -562,6 +679,10 @@ IDENTITY — links, per proposition:
   statements are the same claim at different precision or from different angles, LINK them. Only genuinely distinct
   propositions — different claims about the world — stay apart. You are NOT guarding against wrong merges; you are
   hunting for right ones.
+
+STATED ONLY FOR ATTRIBUTION — a proposition marked "forAttributionOnly": true is not new knowledge: the extractor
+stated it only to name an idea a question tested. Link it exactly as above when an existing node states it. If none
+does, add nothing — it is dropped, never created.
 
 Your deliverable is ONLY the identity verdicts: "links". NEVER restate the propositions —
 the merger already has them. You NEVER create relations between propositions — they come from the
@@ -771,23 +892,6 @@ export interface ExtractionPipeline {
 	importNotes(input: NotesImportInput): Promise<EmissionStats>;
 }
 
-/** pi's per-step usage, flattened to the persisted CallUsage fields
- *  (the money channel's capture shape, contracts/chat.ts). Exported for
- *  the cluster namer — the same capture shape (2026-09 graph cost
- *  metrics wave). Module scope: no closure deps, pure projection. */
-export function callUsage(usage: Usage): CallUsage {
-	return {
-		inputTokens: usage.input,
-		outputTokens: usage.output,
-		cacheReadTokens: usage.cacheRead,
-		cacheWriteTokens: usage.cacheWrite,
-		cacheWrite1hTokens: usage.cacheWrite1h ?? 0,
-		// Optional in pi's Usage (providers that never emit reasoning
-		// tokens leave it unset) — persisted as 0, never dropped.
-		reasoningTokens: usage.reasoning ?? 0,
-	};
-}
-
 export function createExtractionPipeline(deps: ExtractionPipelineDeps): ExtractionPipeline {
 	const { chatStore, graphStore } = deps;
 	// Stage-engine resolution: a direct test value wins; otherwise the
@@ -915,6 +1019,7 @@ export function createExtractionPipeline(deps: ExtractionPipelineDeps): Extracti
 		sourceId: string,
 		view: string,
 		batchIds: ReadonlySet<string>,
+		checks: ReadonlyArray<ViewCheck>,
 	): Promise<SessionFindings> {
 		const signal = runningExtractions.get(jobKey)?.controller.signal;
 		signal?.throwIfAborted(); // an abort during a sync gap ends the job here
@@ -939,6 +1044,7 @@ export function createExtractionPipeline(deps: ExtractionPipelineDeps): Extracti
 			prompt,
 			new Set(graph.nodes.map((n) => n.id)),
 			batchIds,
+			checks,
 			signal,
 			(usage, model, step, finishReason, tools) => {
 				recordStep(jobKey, "extractor", callUsage(usage), model);
@@ -976,6 +1082,8 @@ export function createExtractionPipeline(deps: ExtractionPipelineDeps): Extracti
 							name: p.name,
 							statement: p.statement,
 							aliases: p.aliases,
+							// Link-or-drop, never create (#11).
+							...(p.forAttributionOnly === true ? { forAttributionOnly: true } : {}),
 						})),
 					},
 					null,
@@ -1123,10 +1231,13 @@ export function createExtractionPipeline(deps: ExtractionPipelineDeps): Extracti
 				return { nodes: 0, chains: 0 };
 			}
 			const chunkTokens = deps.getChunkTokens?.() ?? FACTORY_SETTINGS.graph.extractionChunkTokens;
-			// The batcher's one rule (owner, Wave D): a tool-call message and
-			// its result message(s) are INSEPARABLE — one chunk, covered
-			// together, read together (core/coverage.ts batchRuns).
-			const batches = batchRuns(covered.slots, covered.uncovered, chunkTokens);
+			// Batches are runs of uncovered teacher-prose messages
+			// (core/coverage.ts batchRuns). Posed checks ride along as
+			// context outside coverage (ADR-0004, core/check-view.ts): each
+			// travels with its own message's prose, or the next prose after
+			// it, and weighs on the fill budget only.
+			const extraction = extractionViewOf(record.messages, covered.slots, failedOutputCalls);
+			const batches = batchRuns(covered.slots, covered.uncovered, chunkTokens, extraction.extraTokens);
 			console.info(
 				`[extraction ${chatId}] pipeline start — ${covered.uncoveredTokens} uncovered tok, ` +
 					`${covered.uncoveredCount} messages, ${batches.length} batch(es) of ≤${chunkTokens} tok`,
@@ -1147,13 +1258,15 @@ export function createExtractionPipeline(deps: ExtractionPipelineDeps): Extracti
 					settled.push({
 						status: "fulfilled",
 						value: await runJob({ id: chatId, kind: "chat", part }, async (jobKey) => {
-							// The batch's source view: TEACHER PROSE ONLY (owner,
-							// 2026-09-28), each passage labeled with its ACTUAL message
-							// id (2026-10-13) — the view lines ARE the coverage
-							// fingerprints' messageViewLines ("TEACHER [id] text"), one
-							// shared seam.
+							// The batch's source view: the teacher's prose, each passage
+							// labeled with its ACTUAL message id (2026-10-13) in exactly
+							// the lines the coverage fingerprints hash ("TEACHER [id]
+							// text"), plus the checks travelling with it as posed
+							// (ADR-0004: "CHECK q1 [id]" blocks, context only — the
+							// extractor attributes them by alias, #9).
 							const messages = batch.map((slot) => slot.message);
-							const view = proseView(messages, record.title, failedOutputCalls);
+							const batchView = extraction.viewOf(batch);
+							const view = renderView(batchView.lines, record.title);
 							// The batch's teacher-prose ids — the ONLY anchors this
 							// job's submit may name (validateSessionAnchors at the
 							// submit seam refuses anything else: ids from other
@@ -1165,7 +1278,7 @@ export function createExtractionPipeline(deps: ExtractionPipelineDeps): Extracti
 							setPhase(jobKey, "queued", "chat", undefined, part);
 							const findings = await withExtractSlot(jobKey, async () => {
 								setPhase(jobKey, "extracting", "chat", undefined, part);
-								return extract(jobKey, chatId, view, batchIds);
+								return extract(jobKey, chatId, view, batchIds, batchView.checks);
 							});
 							// SERIALIZED AUDIT (owner, 2026-09-28): audit + merge are the
 							// graph-mutating critical section — one job at a time,
@@ -1185,10 +1298,12 @@ export function createExtractionPipeline(deps: ExtractionPipelineDeps): Extracti
 									gone.name = "AbortError";
 									throw gone;
 								}
-								// The batch's messages, snapshotted when the run computed
-								// coverage — if a message mutates mid-run (a quiz answer
-								// merges in), the stored fingerprint won't match its new
-								// one and it re-opens: honest by construction.
+								// The batch's prose messages, snapshotted when the run
+								// computed coverage — if one's teacher prose changes
+								// mid-run, the stored fingerprint won't match its new one
+								// and it re-opens: honest by construction. (Answers never
+								// re-open anything: a result is invisible to coverage, and
+								// the checks travelling with the batch get no row.)
 								const foldedAt = new Date().toISOString();
 								const batchStats = mergeFindings(chatId, findings, auditResult, { chatStore, graphStore }, {
 									foldedAt,
@@ -1418,7 +1533,7 @@ export function createExtractionPipeline(deps: ExtractionPipelineDeps): Extracti
 	/** Every explicit import processes the whole file. Identity, source digest,
 	 * auditor and usage history remain source-scoped; this is not exactly-once. */
 	async function importNotes(input: NotesImportInput): Promise<EmissionStats> {
-		const id = `src_${crypto.createHash("sha256").update(input.filePath).digest("hex").slice(0, 12)}`;
+		const id = `${NOTES_SOURCE_ID_PREFIX}${crypto.createHash("sha256").update(input.filePath).digest("hex").slice(0, 12)}`;
 		// Acquire BEFORE source upsert: overlapping contents must not alter metadata.
 		if (inFlight.has(id)) throw new NotesImportError("busy", { nodes: 0, chains: 0 }, "This file is already being imported. Try again when it finishes.");
 		inFlight.add(id);

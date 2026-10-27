@@ -147,7 +147,7 @@ describe("coverageOf — uncovered is DERIVED, never dual-tracked", () => {
 			{ chatId: "c2", fp: slot(messages, "m3").fp, tokens: 1, foldedAt: "2026-09-15T00:00:00.000Z" },
 		];
 		const cov = coverageOf(messages, entries, "c1");
-		// `uncovered` is INDEXES (the batcher needs positions for bonding):
+		// `uncovered` is INDEXES (the batcher batches by position):
 		assert.deepEqual(cov.uncovered, [2]);
 		assert.deepEqual(cov.slots[cov.uncovered[0]!]!.message.id, "m3");
 		assert.equal(cov.coveredCount, 2);
@@ -223,6 +223,70 @@ describe("batchRuns — token-budgeted, consecutive, never splits a message", ()
 	});
 });
 
+describe("checks are context outside coverage (ADR-0004, #8)", () => {
+	const posedQuiz = {
+		id: "call-1",
+		name: "quiz",
+		args: {
+			type: "check",
+			nodeId: "n1",
+			question: "Which rule differentiates a composition?",
+			options: [{ label: "The product rule", value: "product" }, { label: "The chain rule", value: "chain" }],
+			explanation: "Composition.",
+			correctAnswer: "chain",
+		},
+	};
+	function proseWithCheck(id: string, text: string): LhMessage {
+		return {
+			id,
+			role: "assistant",
+			content: [{ type: "text", text }, { type: "toolCall", id: posedQuiz.id, name: posedQuiz.name, arguments: posedQuiz.args }],
+		} as unknown as LhMessage;
+	}
+
+	it("a message's fingerprint is its prose alone — a posed check in it changes nothing", () => {
+		// The literal is sha256(JSON.stringify(["assistant", ["TEACHER [t1] The chain rule multiplies rates."]]))
+		// — the pre-#8 fingerprint; every covered message must keep it.
+		const PINNED = "f56b56bace1da3e65d4d49e78cf9defd784dbd387c52aab1d9a5030471019b87";
+		assert.equal(messageFingerprint(teacher("t1", "The chain rule multiplies rates.")), PINNED);
+		assert.equal(messageFingerprint(proseWithCheck("t1", "The chain rule multiplies rates.")), PINNED);
+		assert.equal(
+			slot([proseWithCheck("t1", "The chain rule multiplies rates.")], "t1").tokens,
+			slot([teacher("t1", "The chain rule multiplies rates.")], "t1").tokens,
+			"coverage tokens are the prose's alone",
+		);
+	});
+
+	it("asking or answering a check never opens a run", () => {
+		const taught = [teacher("t1", "The chain rule multiplies rates.")];
+		const entries: CoverageEntry[] = coverageSlots(taught).map((s) => ({
+			chatId: "c1", fp: s.fp, tokens: s.tokens, foldedAt: "2026-10-27T00:00:00.000Z",
+		}));
+		const asked = [...taught, user("u1", "quiz me"), assistantWithCalls("a2", [posedQuiz])];
+		const answered = [...asked, result("r1", posedQuiz.id, "quiz", { questionText: "Q?", correct: true, confidence: 70 })];
+		for (const messages of [asked, answered]) {
+			const cov = coverageOf(messages, entries, "c1");
+			assert.equal(cov.uncoveredTokens, 0, "the trigger's measure stays at zero");
+			assert.deepEqual(cov.uncovered, []);
+		}
+	});
+});
+
+describe("batchRuns — check weight on the fill budget (ADR-0004, #8)", () => {
+	it("a slot's extra weight moves the split; without it the split is unchanged", () => {
+		const slots = coverageSlots([
+			teacher("m1", "a".repeat(40)),
+			teacher("m2", "b".repeat(40)),
+			teacher("m3", "c".repeat(40)),
+		]);
+		const ids = (runs: ReturnType<typeof batchRuns>) => runs.map((r) => r.map((s) => s.message.id));
+		assert.deepEqual(ids(batchRuns(slots, [0, 1, 2], 45)), [["m1", "m2", "m3"]]);
+		// m2 carries 10 tokens of checks: 14 + 24 fits, + 14 overflows.
+		const extra = (s: (typeof slots)[number]) => (s.message.id === "m2" ? 10 : 0);
+		assert.deepEqual(ids(batchRuns(slots, [0, 1, 2], 45, extra)), [["m1", "m2"], ["m3"]]);
+	});
+});
+
 describe("batchTag — deterministic, ref-stable, mutation-sensitive", () => {
 	it("the same members in the same order → the same 12-hex tag; a different order is a different batch", () => {
 		const slots = coverageSlots([teacher("m1", "aaaa"), teacher("m2", "bbbb")]);
@@ -231,7 +295,7 @@ describe("batchTag — deterministic, ref-stable, mutation-sensitive", () => {
 		assert.match(batchTag(slots), /^[0-9a-f]{12}$/);
 	});
 
-	it("a re-opened member changes the tag — its observations land as new events", () => {
+	it("a re-opened member changes the tag", () => {
 		const slots = coverageSlots([teacher("m1", "aaaa"), teacher("m2", "bbbb")]);
 		const mutated = coverageSlots([teacher("m1", "aaaa!"), teacher("m2", "bbbb")]);
 		assert.notEqual(batchTag(slots), batchTag(mutated));

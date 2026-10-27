@@ -25,10 +25,14 @@ import {
 	fauxToolCall,
 	type FauxResponseStep,
 } from "@earendil-works/pi-ai";
-import { createTeacherAgent } from "../src/agent/teacher-agent.ts";
-import { createTeacherTools } from "../src/agent/tools.ts";
-import { handleChatInput, handleChatRequest } from "../src/server/chat-handler.ts";
-import { effectiveSettings } from "../src/server/stores.ts";
+import type { AgentTool } from "@earendil-works/pi-agent-core";
+import { bareQuestionTools, createTeacherAgent } from "../src/agent/teacher-agent.ts";
+import { createTeacherTools, probeExplainTool, teachExplainToolFor } from "../src/agent/tools.ts";
+import { graderModelOverride, graderTimeoutMs } from "../src/agent/subagents/grader.ts";
+import { extraction, handleChatInput, handleChatRequest } from "../src/server/chat-handler.ts";
+import { coverageOf } from "../src/core/coverage.ts";
+import { effectiveSettings, stores } from "../src/server/stores.ts";
+import type { AnswerEntry, CoverageEntry, EvidenceEntry } from "../src/core/contracts.ts";
 import { isTurnRunning } from "../src/server/turn-liveness.ts";
 import { deliverJobResult, registerLiveAgent, setTurnRunner, steerLiveChat, unregisterLiveAgent } from "../src/server/jobs.ts";
 import { SessionModel } from "../components/session-core.ts";
@@ -36,9 +40,10 @@ import { buildSubagentSteer } from "../src/core/contracts.ts";
 import { abortTurn, runningTurn, settledTurnResponse } from "../src/server/turn-runs.ts";
 import { chatStore } from "../src/store/chats.ts";
 import { jobStore } from "../src/store/jobs.ts";
-import { buildAnswer, dismissedAnswer, normalizeOptions, resolveCorrect, type QuestionData } from "../src/core/question-core.ts";
+import { buildAnswer, dismissedAnswer, normalizeOptions, questionDataFor, resolveCorrect, type QuestionData } from "../src/core/question-core.ts";
 import { danglingQuestionOf, endsInDismissal, needsContinuation, newAnswerResult, newUserMessage } from "../src/core/native-messages.ts";
 import { projectView } from "../src/core/view.ts";
+import { parseExplainInput, parseQuizInput } from "../src/core/tool-parts.ts";
 import type { PiEngine } from "../src/agent/models.ts";
 import type { LhMessage } from "../src/core/native-messages.ts";
 
@@ -55,6 +60,19 @@ import { PATHS } from "../config.ts";
 // turns pin openrouter per chat — the gate reads env-first truth, so the
 // key must be present in the test process like any real setup.
 process.env.OPENROUTER_API_KEY ??= "test-key-presence-gate";
+
+// The evidence ledger (#9, owner 2026-10-27): the handler's graph store is
+// overridden so answer entries land in memory — no test writes data/graph.
+const evidenceLines: EvidenceEntry[] = [];
+const realGraphStore = stores.graphStore;
+stores.graphStore = {
+	...realGraphStore,
+	appendEvidence: (entry) => void evidenceLines.push(structuredClone(entry)),
+	readEvidence: () => evidenceLines.map((entry) => structuredClone(entry)),
+};
+after(() => {
+	stores.graphStore = realGraphStore;
+});
 
 const QUIZ_INPUT = {
 	question: "Which planet is closest to the sun?",
@@ -1300,6 +1318,7 @@ it("explain tool call persists as a pending part; the free-text answer reveals t
 	const EXPLAIN_INPUT = {
 		question: "Explain why Mercury is hard to observe.",
 		correctAnswer: "Its small angular separation from the Sun — it never strays far from the Sun in our sky.",
+		keyPoints: KEY_POINTS,
 		nodeId: "planet-order",
 		type: "check", // the teach explain's role field (owner, 2026-10-09)
 	};
@@ -1740,5 +1759,703 @@ describe("duplicate provider tool-call ids (the Lacan fix)", () => {
 		assert.equal(askPart?.output?.kind, "ask", "the ask card keeps its own answer");
 		assert.equal(quizPart?.state, "output-available");
 		assert.equal(quizPart?.output?.kind, "quiz", "the quiz card got ITS answer (the pre-fix bug: it landed on the ask card)");
+	});
+});
+
+// ─── key points: the gradeable commitment (#6, ADR-0003) ───────────────────
+
+const KEY_POINTS = [
+	{ id: "p1", text: "Mercury's orbit keeps it close to the Sun in our sky.", kind: "fact", required: true },
+	{ id: "p2", text: "The Sun's glare hides anything that close to it.", kind: "reason", required: false },
+];
+
+describe("explain and recall commit key points — ungradeable commitments are refused and retried", () => {
+	const TEACH_EXPLAIN = {
+		type: "check",
+		nodeId: "planet-order",
+		question: "Explain why Mercury is hard to observe.",
+		correctAnswer: "It never strays far from the Sun in our sky, so the Sun's glare hides it.",
+		keyPoints: KEY_POINTS,
+	};
+	const PROBE_RECALL = {
+		question: "Explain why Mercury is hard to observe.",
+		correctAnswer: "It never strays far from the Sun in our sky, so the Sun's glare hides it.",
+		keyPoints: KEY_POINTS,
+	};
+	const point = (id: string, required = true) => ({ id, text: `Point ${id}.`, kind: "fact", required });
+	const badShapes: Array<[string, (input: Record<string, unknown>) => Record<string, unknown>, RegExp]> = [
+		["no keyPoints", ({ keyPoints: _drop, ...rest }) => rest, /keyPoints/],
+		["an empty keyPoints list", (input) => ({ ...input, keyPoints: [] }), /keyPoints/],
+		["more than 4 key points", (input) => ({ ...input, keyPoints: ["p1", "p2", "p3", "p4", "p5"].map((id) => point(id)) }), /keyPoints/],
+		["duplicate key point ids", (input) => ({ ...input, keyPoints: [point("p1"), point("p1")] }), /duplicate key point id \\"p1\\"/],
+		["no required key point", (input) => ({ ...input, keyPoints: [point("p1", false), point("p2", false)] }), /required/],
+	];
+
+	for (const [toolName, good] of [
+		["explain", TEACH_EXPLAIN],
+		["recall", PROBE_RECALL],
+	] as const) {
+		for (const [shape, mutate, problem] of badShapes) {
+			it(`${toolName} with ${shape} is refused at the call boundary and the model retries`, async () => {
+				const bad = mutate(good);
+				const steps = (cs: string[][]): FauxResponseStep[] => [
+					(context) => {
+						cs.push(context.messages.map((m) => JSON.stringify((m as { content: unknown }).content)));
+						return fauxAssistantMessage([fauxToolCall(toolName, bad as never, { id: "call-bad" })], { stopReason: "toolUse" });
+					},
+					(context) => {
+						cs.push(context.messages.map((m) => JSON.stringify((m as { content: unknown }).content)));
+						return fauxAssistantMessage([fauxToolCall(toolName, good, { id: "call-good" })], { stopReason: "toolUse" });
+					},
+				];
+				const { engine, calls } = scriptedTeacher(steps);
+				const chat = createConfiguredChat(`Test: ${toolName} ${shape}`);
+				createdChats.push(chat.id);
+				const tools: Record<string, AgentTool<any>> =
+					toolName === "explain"
+						? { explain: teachExplainToolFor({ chatId: chat.id, chatStore }) }
+						: { recall: probeExplainTool };
+				const factory: Parameters<typeof handleChatRequest>[1] = (opts) =>
+					createTeacherAgent(undefined, { engine, messages: opts.messages, tools });
+				const body = await drainTurn(post(chat.id, { type: "text", text: "quiz me" }), factory);
+
+				const events = eventsOf(body);
+				const badEnd = events.find((e) => e.type === "tool_execution_end" && e.toolCallId === "call-bad");
+				assert.equal(badEnd?.isError, true, "the ungradeable call surfaced as an error execution");
+				const goodEnd = events.find((e) => e.type === "tool_execution_end" && e.toolCallId === "call-good");
+				assert.equal(goodEnd?.isError, false, "the retry is clean — the dock mounts on it");
+				assert.equal(calls.length, 2, "the refusal re-prompted the model");
+				assert.match(calls[1]!.join(" "), problem, "the problem reached the model");
+				const pending = danglingQuestionOf(chatStore.getChat(chat.id)!.messages);
+				assert.equal(pending?.toolCallId, "call-good", "the retried question is the pending one");
+			});
+		}
+	}
+
+	it("a valid explain is posed, and its key points are stored with the commitment on the answer record", async () => {
+		const { engine } = scriptedTeacher(() => [
+			() => fauxAssistantMessage([fauxToolCall("explain", TEACH_EXPLAIN, { id: "call-kp" })], { stopReason: "toolUse" }),
+			() => fauxAssistantMessage([fauxText("Good.")]),
+		]);
+		const chat = createConfiguredChat("Test: explain key points stored");
+		createdChats.push(chat.id);
+		const tools = { explain: teachExplainToolFor({ chatId: chat.id, chatStore }) };
+		const factory: Parameters<typeof handleChatRequest>[1] = (opts) =>
+			createTeacherAgent(undefined, { engine, messages: opts.messages, tools });
+		await drainTurn(post(chat.id, { type: "text", text: "teach me" }), factory);
+
+		const pending = danglingQuestionOf(chatStore.getChat(chat.id)!.messages);
+		assert.equal(pending?.toolCallId, "call-kp", "the explain was posed");
+
+		// The dock's own path: the question data built from the posed call,
+		// then the learner's answer.
+		const qd = questionDataFor("explain", pending!.toolCallId, parseExplainInput(pending!.input)!, { now: new Date().toISOString() });
+		const answer = buildAnswer(qd, { text: "It is always near the Sun." }, "explain");
+		await drainTurn(post(chat.id, { type: "answer", toolCallId: "call-kp", answer }), factory);
+
+		const saved = chatStore.getChat(chat.id)!;
+		const result = saved.messages.find((m) => (m as { role?: string }).role === "toolResult") as {
+			details?: { committed?: string; keyPoints?: unknown };
+		};
+		assert.equal(result.details?.committed, TEACH_EXPLAIN.correctAnswer);
+		assert.deepEqual(result.details?.keyPoints, KEY_POINTS, "the key points ride the answer record beside the commitment");
+	});
+});
+
+describe("old explain/recall records without key points still load", () => {
+	it("the golden teach chat (recall ×1, explain ×2, no key points) loads, its record reads back, and a new turn runs over it", async () => {
+		const golden = JSON.parse(
+			fs.readFileSync(path.join(import.meta.dirname, "fixtures", "golden-data", "chats", "chat_mv27rrra_feff23b6.json"), "utf-8"),
+		) as { messages: LhMessage[] };
+		const oldCalls = golden.messages.flatMap((m) =>
+			m.role === "assistant" ? m.content.filter((b) => b.type === "toolCall" && (b.name === "explain" || b.name === "recall")) : [],
+		);
+		assert.equal(oldCalls.length, 3, "the fixture still holds the three old free-recall calls");
+		assert.ok(oldCalls.every((b) => b.type === "toolCall" && !("keyPoints" in b.arguments)), "none has key points");
+
+		const chat = createConfiguredChat("Test: old free-recall records");
+		createdChats.push(chat.id);
+		chatStore.saveMessages(chat.id, golden.messages);
+		const before = evidenceLines.length;
+
+		const res = await recordRoute.GET(new Request("http://test/record"), { params: Promise.resolve({ id: chat.id }) });
+		assert.equal(res.status, 200);
+		const snapshot = (await res.json()) as { messages: LhMessage[] };
+		assert.equal(snapshot.messages.length, golden.messages.length);
+		assert.doesNotThrow(() => projectView(snapshot.messages));
+
+		const { engine, calls } = scriptedTeacher((cs) => [
+			(context) => {
+				cs.push(context.messages.map((m) => JSON.stringify((m as { content: unknown }).content)));
+				return fauxAssistantMessage([fauxText("Picking up where we left off.")]);
+			},
+		]);
+		const body = await drainTurn(post(chat.id, { type: "text", text: "Let's continue." }), agentFactory(engine));
+		assert.deepEqual(eventsOf(body).filter((e) => e.type === "error"), []);
+		assert.equal(calls.length, 1, "the teacher ran over the old history");
+		assert.ok(calls[0]!.join(" ").includes("It is updated with the Bayes theorem"), "the old recall answer is in its context");
+		assert.equal(evidenceLines.length, before, "loading old records writes no evidence");
+	});
+});
+
+// ─── the independent grader (#7, ADR-0003) ─────────────────────────────────
+
+describe("the independent grader puts a verdict on each production answer", () => {
+	const GRADED_POINTS = [
+		{ id: "p1", text: "Mercury never strays far from the Sun in our sky.", kind: "fact", required: true },
+		{ id: "p2", text: "The Sun's glare hides objects that close to it.", kind: "reason", required: true },
+		{ id: "p3", text: "It is best seen just after sunset or before sunrise.", kind: "fact", required: false },
+	];
+	const GRADED_EXPLAIN = {
+		type: "check",
+		nodeId: "planet-order",
+		question: "Explain why Mercury is hard to observe.",
+		correctAnswer: "It never strays far from the Sun in our sky, so the Sun's glare hides it; look just after sunset.",
+		keyPoints: GRADED_POINTS,
+	};
+	const LEARNER_TEXT = "Mercury always sits right next to the Sun when we look up.";
+
+	type Status = "present" | "absent" | "contradicted";
+	/** The grader's submit payload, rationale first (the order it writes). */
+	function verdictCall(statuses: Status[], extra: { attempt?: string; extraErrors?: string[]; uncertain?: boolean } = {}) {
+		return {
+			rationale: "Checked each key point against the answer by gist.",
+			attempt: extra.attempt ?? "answered",
+			points: statuses.map((status, i) => ({ id: `p${i + 1}`, status, evidence: status === "absent" ? "" : "always sits right next to the Sun" })),
+			extraErrors: (extra.extraErrors ?? []).map((claim) => ({ claim })),
+			uncertain: extra.uncertain ?? false,
+		};
+	}
+
+	/** A scripted grader: each plain step submits that payload; a function
+	 *  step runs as-is. `seen` captures everything the grader model was given. */
+	function scriptedGrader(steps: unknown[]): { engine: PiEngine; seen: string[] } {
+		const seen: string[] = [];
+		const faux = createFauxCore({});
+		faux.setResponses(
+			steps.map((step) =>
+				typeof step === "function"
+					? (step as FauxResponseStep)
+					: ((context: { systemPrompt?: string; messages: unknown[] }) => {
+							seen.push(JSON.stringify({ systemPrompt: context.systemPrompt, messages: context.messages }));
+							return fauxAssistantMessage([fauxToolCall("submit_verdict", step as never)], { stopReason: "toolUse" });
+						}) as unknown as FauxResponseStep,
+			),
+		);
+		return { engine: { model: faux.getModel(), streamFn: faux.streamSimple }, seen };
+	}
+
+	/** Pose GRADED_EXPLAIN, answer it, and return what the teacher's next
+	 *  turn received plus the stored answer record. */
+	async function poseAndAnswer(answerReq: Parameters<typeof buildAnswer>[1], grader?: PiEngine) {
+		const { engine, calls } = scriptedTeacher((cs) => [
+			(context) => {
+				cs.push(context.messages.map((m) => JSON.stringify((m as { content: unknown }).content)));
+				return fauxAssistantMessage(
+					[fauxText("TEACHER-PROSE-BEFORE-THE-QUESTION"), fauxToolCall("explain", GRADED_EXPLAIN, { id: "call-g" })],
+					{ stopReason: "toolUse" },
+				);
+			},
+			(context) => {
+				cs.push(context.messages.map((m) => JSON.stringify((m as { content: unknown }).content)));
+				return fauxAssistantMessage([fauxText("Let me repair what you missed.")]);
+			},
+		]);
+		const chat = createConfiguredChat("Test: graded explain");
+		createdChats.push(chat.id);
+		const tools = { explain: teachExplainToolFor({ chatId: chat.id, chatStore }) };
+		const factory: Parameters<typeof handleChatRequest>[1] = (opts) =>
+			createTeacherAgent(undefined, { engine, messages: opts.messages, tools });
+		await drainTurn(post(chat.id, { type: "text", text: "LEARNER-OPENING-LINE" }), factory);
+		const pending = danglingQuestionOf(chatStore.getChat(chat.id)!.messages)!;
+		const qd = questionDataFor("explain", pending.toolCallId, parseExplainInput(pending.input)!, { now: new Date().toISOString() });
+		const answer = buildAnswer(qd, answerReq, "explain");
+		graderModelOverride.current = grader;
+		try {
+			await drainTurn(post(chat.id, { type: "answer", toolCallId: "call-g", answer }), factory);
+		} finally {
+			graderModelOverride.current = undefined;
+		}
+		const saved = chatStore.getChat(chat.id)!;
+		const result = saved.messages.find((m) => (m as { role?: string }).role === "toolResult") as {
+			details: Record<string, any>;
+		};
+		// What the teacher's next turn read for the answer: the tool result's
+		// model-visible JSON, as the provider received it.
+		const teacherSaw = calls[1] ? JSON.parse(JSON.parse(calls[1].at(-1)!)[0].text) : undefined;
+		return { stored: result.details, teacherSaw, teacherCalls: calls.length, chatId: chat.id };
+	}
+
+	it("posed explain → answer → the faux grader's verdict is stored on the answer and the teacher sees the label and per-point statuses", async () => {
+		const grader = scriptedGrader([verdictCall(["present", "absent", "absent"])]);
+		const { stored, teacherSaw } = await poseAndAnswer({ text: LEARNER_TEXT, confidence: 70, confidenceTouched: true }, grader.engine);
+
+		assert.equal(grader.seen.length, 1, "the grader ran once");
+		assert.deepEqual(stored.verdict, {
+			rationale: "Checked each key point against the answer by gist.",
+			attempt: "answered",
+			points: [
+				{ id: "p1", status: "present", evidence: "always sits right next to the Sun" },
+				{ id: "p2", status: "absent", evidence: "" },
+				{ id: "p3", status: "absent", evidence: "" },
+			],
+			extraErrors: [],
+			uncertain: false,
+		});
+		assert.deepEqual(teacherSaw.verdict, {
+			label: "incomplete",
+			points: [
+				{ id: "p1", status: "present" },
+				{ id: "p2", status: "absent" },
+				{ id: "p3", status: "absent" },
+			],
+		});
+		assert.equal(teacherSaw.text, LEARNER_TEXT, "the learner's words still reach the teacher");
+	});
+
+	it("the grader sees only the question, the commitment and the learner's answer", async () => {
+		const grader = scriptedGrader([verdictCall(["present", "present", "absent"])]);
+		await poseAndAnswer(
+			{ text: LEARNER_TEXT, confidence: 90, confidenceTouched: true, thinking: "LEARNER-THINKING-ON-QUESTION", readingThinking: "LEARNER-THINKING-WHILE-READING" },
+			grader.engine,
+		);
+		assert.equal(grader.seen.length, 1);
+		const seen = grader.seen[0]!;
+		for (const shown of [GRADED_EXPLAIN.question, GRADED_EXPLAIN.correctAnswer, ...GRADED_POINTS.map((p) => p.text), LEARNER_TEXT]) {
+			assert.ok(seen.includes(JSON.stringify(shown).slice(1, -1)), `the grader was shown: ${shown}`);
+		}
+		for (const hidden of ["LEARNER-OPENING-LINE", "TEACHER-PROSE-BEFORE-THE-QUESTION", "LEARNER-THINKING-ON-QUESTION", "LEARNER-THINKING-WHILE-READING", "confidence"]) {
+			assert.ok(!seen.includes(hidden), `the grader was NOT shown: ${hidden}`);
+		}
+		// The confidence value as a value of its own — never the digits
+		// inside a message timestamp (1793139089230 holds "90").
+		assert.doesNotMatch(seen, /\b90\b/, "the grader was NOT shown: 90");
+	});
+
+	it("'I don't know' never calls the grader; the teacher sees dont_know", async () => {
+		const grader = scriptedGrader([verdictCall(["present", "present", "present"])]);
+		const { stored, teacherSaw, teacherCalls } = await poseAndAnswer({ dontKnow: true, text: "typed then discarded" }, grader.engine);
+		assert.equal(grader.seen.length, 0, "the grader was never called");
+		assert.equal(stored.verdict, undefined, "no verdict on a don't-know answer");
+		assert.equal(teacherCalls, 2, "the teacher's turn ran");
+		assert.deepEqual(teacherSaw.verdict, { label: "dont_know" });
+	});
+
+	/** The evidence ledger's answer entry for a chat's question. */
+	const answerEntryOf = (chatId: string): AnswerEntry | undefined =>
+		evidenceLines.find((e): e is AnswerEntry => e.type === "answer" && e.chatId === chatId);
+
+	it("the graded answer becomes an answer entry: verdict, confidence with the untouched flag, thinking, anchors, kind and phase", async () => {
+		const grader = scriptedGrader([verdictCall(["present", "absent", "contradicted"])]);
+		const { stored, chatId } = await poseAndAnswer(
+			{ text: LEARNER_TEXT, confidence: 50, confidenceTouched: false, thinking: "LEARNER-THINKING-ON-QUESTION" },
+			grader.engine,
+		);
+		const entry = answerEntryOf(chatId);
+		assert.ok(entry, "an answer entry was written");
+		const messages = chatStore.getChat(chatId)!.messages;
+		const asking = messages.find((m) => m.role === "assistant" && m.content.some((b) => b.type === "toolCall" && b.id === "call-g"))!;
+		const result = messages.find((m) => m.role === "toolResult")!;
+		const { at, ...rest } = entry;
+		assert.ok(!Number.isNaN(Date.parse(at)), "timestamped");
+		assert.deepEqual(rest, {
+			type: "answer",
+			toolCallId: "call-g",
+			chatId,
+			questionMessageId: asking.id,
+			answerMessageId: result.id,
+			kind: "production",
+			phase: "probe", // no probe_done in this chat
+			dontKnow: false,
+			verdict: stored.verdict,
+			confidence: 50,
+			confidenceTouched: false,
+			thinking: "LEARNER-THINKING-ON-QUESTION",
+		});
+	});
+
+	it("'I don't know' is an answer entry too, with no verdict", async () => {
+		const { chatId } = await poseAndAnswer({ dontKnow: true }, scriptedGrader([]).engine);
+		const entry = answerEntryOf(chatId)!;
+		assert.equal(entry.dontKnow, true);
+		assert.equal(entry.verdict, undefined);
+		assert.equal(entry.kind, "production");
+	});
+
+	describe("grading failures record an uncertain verdict and the turn proceeds", () => {
+		const failures: Array<[string, () => { engine: PiEngine; seen: string[] }, RegExp]> = [
+			[
+				"malformed output, twice (one retry)",
+				() => scriptedGrader([{ ...verdictCall(["present", "absent"]) }, { rationale: "no labels" }]),
+				/never submitted/,
+			],
+			[
+				"a thrown call",
+				() =>
+					scriptedGrader([
+						(() => {
+							throw new Error("provider exploded");
+						}) as unknown as FauxResponseStep,
+					]),
+				/provider exploded/,
+			],
+			[
+				"a timeout",
+				() =>
+					scriptedGrader([
+						((_ctx: unknown, opts: { signal?: AbortSignal } | undefined) =>
+							new Promise((resolve) => {
+								opts?.signal?.addEventListener("abort", () => resolve(fauxAssistantMessage("late")), { once: true });
+							})) as unknown as FauxResponseStep,
+					]),
+				/timed out/,
+			],
+		];
+		for (const [what, makeGrader, reason] of failures) {
+			it(what, async () => {
+				const grader = makeGrader();
+				const before = graderTimeoutMs.current;
+				graderTimeoutMs.current = 300;
+				let outcome;
+				try {
+					outcome = await poseAndAnswer({ text: LEARNER_TEXT, confidence: 50, confidenceTouched: false }, grader.engine);
+				} finally {
+					graderTimeoutMs.current = before;
+				}
+				assert.equal(outcome.stored.verdict?.uncertain, true, "an uncertain verdict was recorded");
+				assert.deepEqual(outcome.stored.verdict?.points, [], "no statuses on an uncertain verdict");
+				assert.match(outcome.stored.verdict?.rationale ?? "", reason, "the reason is kept for audit");
+				assert.equal(outcome.teacherCalls, 2, "the teacher's turn still ran");
+				assert.deepEqual(outcome.teacherSaw.verdict, { label: "ungraded" });
+			});
+		}
+
+		it("a valid verdict on the retry is kept (the one retry)", async () => {
+			const grader = scriptedGrader([verdictCall(["present", "present"]), verdictCall(["present", "present", "present"])]);
+			const { stored, teacherSaw } = await poseAndAnswer({ text: LEARNER_TEXT }, grader.engine);
+			assert.equal(grader.seen.length, 2, "the first output was refused and retried");
+			assert.match(grader.seen[1]!, /p3/, "the problem reached the grader");
+			assert.equal(stored.verdict?.uncertain, false);
+			assert.equal(teacherSaw.verdict.label, "correct");
+		});
+	});
+
+	it("a missing key for the grader's model slot is refused like extraction's: an uncertain verdict, the grader never called, the turn proceeds", async () => {
+		const grader = scriptedGrader([verdictCall(["present", "present", "present"])]);
+		// The grader's resolved engine names a provider whose key is absent.
+		const keyless: PiEngine = { ...grader.engine, model: { ...grader.engine.model, provider: "cerebras" } };
+		const savedKey = process.env.CEREBRAS_API_KEY;
+		delete process.env.CEREBRAS_API_KEY;
+		let outcome;
+		try {
+			outcome = await poseAndAnswer({ text: LEARNER_TEXT }, keyless);
+		} finally {
+			if (savedKey !== undefined) process.env.CEREBRAS_API_KEY = savedKey;
+		}
+		assert.equal(grader.seen.length, 0, "the keyless grader never ran");
+		assert.equal(outcome.stored.verdict?.uncertain, true);
+		assert.match(outcome.stored.verdict?.rationale ?? "", /no API key for cerebras/);
+		assert.equal(outcome.teacherCalls, 2, "no 503 — the teacher's turn ran");
+		assert.deepEqual(outcome.teacherSaw.verdict, { label: "ungraded" });
+	});
+
+	describe("pass and the display label, through the seam (p1, p2 required; p3 optional)", () => {
+		const cases: Array<[string, ReturnType<typeof verdictCall>, Record<string, unknown>]> = [
+			[
+				"correct: every required point present, the optional one absent (pass)",
+				verdictCall(["present", "present", "absent"]),
+				{ label: "correct", points: [{ id: "p1", status: "present" }, { id: "p2", status: "present" }, { id: "p3", status: "absent" }] },
+			],
+			[
+				"incomplete: a required point absent",
+				verdictCall(["absent", "present", "present"]),
+				{ label: "incomplete", points: [{ id: "p1", status: "absent" }, { id: "p2", status: "present" }, { id: "p3", status: "present" }] },
+			],
+			[
+				"misconception: a contradicted point",
+				verdictCall(["present", "contradicted", "present"]),
+				{ label: "misconception", points: [{ id: "p1", status: "present" }, { id: "p2", status: "contradicted" }, { id: "p3", status: "present" }] },
+			],
+			[
+				"misconception: every point present but an extra error (no pass)",
+				verdictCall(["present", "present", "present"], { extraErrors: ["Mercury is the hottest planet."] }),
+				{
+					label: "misconception",
+					points: [{ id: "p1", status: "present" }, { id: "p2", status: "present" }, { id: "p3", status: "present" }],
+					extraErrors: ["Mercury is the hottest planet."],
+				},
+			],
+			[
+				"off_target: the answer does not attempt the question",
+				verdictCall(["absent", "absent", "absent"], { attempt: "off_target" }),
+				{ label: "off_target", points: [{ id: "p1", status: "absent" }, { id: "p2", status: "absent" }, { id: "p3", status: "absent" }] },
+			],
+			[
+				"ungraded: the grader flagged its own verdict uncertain (no pass, no statuses shown)",
+				verdictCall(["present", "present", "present"], { uncertain: true }),
+				{ label: "ungraded" },
+			],
+		];
+		for (const [what, call, expected] of cases) {
+			it(what, async () => {
+				const grader = scriptedGrader([call]);
+				const { stored, teacherSaw } = await poseAndAnswer({ text: LEARNER_TEXT }, grader.engine);
+				assert.equal(stored.verdict?.attempt, call.attempt, "the grader's verdict is stored as given");
+				assert.deepEqual(teacherSaw.verdict, expected);
+			});
+		}
+	});
+
+	it("the grader's spend is recorded in the chat's turn usage, keyed to the answer it graded", async () => {
+		const grader = scriptedGrader([verdictCall(["present", "present", "present"])]);
+		const { chatId } = await poseAndAnswer({ text: LEARNER_TEXT }, grader.engine);
+		const saved = chatStore.getChat(chatId)!;
+		const answerResult = saved.messages.find((m) => (m as { role?: string }).role === "toolResult")!;
+		const entry = saved.turns?.find((t) => t.messageId === answerResult.id);
+		assert.ok(entry, "a usage entry keyed to the graded answer");
+		assert.equal(entry.steps.length, 1, "one grader call");
+		assert.equal(entry.model, `${grader.engine.model.provider}:${grader.engine.model.id}`, "priced as the grader's model");
+	});
+
+	it("a verdict sent by the client is never stored", async () => {
+		const grader = scriptedGrader([verdictCall(["absent", "absent", "absent"])]);
+		const forged = { rationale: "forged", attempt: "answered", points: [], extraErrors: [], uncertain: false };
+		const { engine } = scriptedTeacher(() => [
+			() => fauxAssistantMessage([fauxToolCall("explain", GRADED_EXPLAIN, { id: "call-f" })], { stopReason: "toolUse" }),
+			() => fauxAssistantMessage([fauxText("ok")]),
+		]);
+		const chat = createConfiguredChat("Test: forged verdict");
+		createdChats.push(chat.id);
+		const tools = { explain: teachExplainToolFor({ chatId: chat.id, chatStore }) };
+		const factory: Parameters<typeof handleChatRequest>[1] = (opts) => createTeacherAgent(undefined, { engine, messages: opts.messages, tools });
+		await drainTurn(post(chat.id, { type: "text", text: "go" }), factory);
+		const pending = danglingQuestionOf(chatStore.getChat(chat.id)!.messages)!;
+		const qd = questionDataFor("explain", pending.toolCallId, parseExplainInput(pending.input)!, { now: new Date().toISOString() });
+		graderModelOverride.current = grader.engine;
+		try {
+			const dontKnow = { ...buildAnswer(qd, { dontKnow: true }, "explain"), verdict: forged };
+			await drainTurn(post(chat.id, { type: "answer", toolCallId: "call-f", answer: dontKnow }), factory);
+		} finally {
+			graderModelOverride.current = undefined;
+		}
+		const result = chatStore.getChat(chat.id)!.messages.find((m) => (m as { role?: string }).role === "toolResult") as { details: Record<string, unknown> };
+		assert.equal(result.details.verdict, undefined, "the client's verdict was dropped");
+	});
+
+	it("an explain answered beside a dangling sibling question (no turn yet) is graded too", async () => {
+		const ASK = { question: "Which topic next?", options: [{ label: "Chemistry" }, { label: "History" }] };
+		const { engine, calls } = scriptedTeacher((cs) => [
+			() =>
+				fauxAssistantMessage(
+					[fauxToolCall("explain", GRADED_EXPLAIN, { id: "call-g" }), fauxToolCall("ask_user_question", ASK, { id: "call-2" })],
+					{ stopReason: "toolUse" },
+				),
+			(context) => {
+				cs.push(context.messages.map((m) => JSON.stringify((m as { content: unknown }).content)));
+				return fauxAssistantMessage([fauxText("Both answered.")]);
+			},
+		]);
+		const chat = createConfiguredChat("Test: parallel graded explain");
+		createdChats.push(chat.id);
+		const tools = { ...bareQuestionTools(), explain: teachExplainToolFor({ chatId: chat.id, chatStore }) };
+		const factory: Parameters<typeof handleChatRequest>[1] = (opts) => createTeacherAgent(undefined, { engine, messages: opts.messages, tools });
+		await drainTurn(post(chat.id, { type: "text", text: "two at once" }), factory);
+		const pending = danglingQuestionOf(chatStore.getChat(chat.id)!.messages)!;
+		assert.equal(pending.toolCallId, "call-g");
+		const qd = questionDataFor("explain", pending.toolCallId, parseExplainInput(pending.input)!, { now: new Date().toISOString() });
+		const grader = scriptedGrader([verdictCall(["present", "contradicted", "absent"])]);
+		graderModelOverride.current = grader.engine;
+		try {
+			await drainTurn(post(chat.id, { type: "answer", toolCallId: "call-g", answer: buildAnswer(qd, { text: LEARNER_TEXT }, "explain") }), factory);
+		} finally {
+			graderModelOverride.current = undefined;
+		}
+		assert.equal(calls.length, 0, "the sibling still dangles — no turn yet");
+		const deferred = chatStore.getChat(chat.id)!.messages.find((m) => (m as { toolCallId?: string }).toolCallId === "call-g") as { details: Record<string, any> };
+		assert.equal(deferred.details.verdict?.points?.[1]?.status, "contradicted", "graded before it was saved");
+		assert.equal(isTurnRunning(chat.id), false, "the deferred answer holds no turn");
+
+		await drainTurn(
+			post(chat.id, { type: "answer", toolCallId: "call-2", answer: { kind: "ask", questionText: ASK.question, dontKnow: false, answers: [], text: "History", answeredAt: new Date().toISOString() } }),
+			factory,
+		);
+		assert.equal(calls.length, 1, "the last answer fired the one turn");
+		assert.match(calls[0]!.join("\n"), /\\"label\\":\\"misconception\\"/, "the teacher's turn saw the verdict");
+	});
+
+	it("answering a check never starts an extraction run — only teacher prose does", async () => {
+		// The trigger is live for this test (it is skipped under NODE_ENV=test),
+		// the pipeline is a spy, and coverage lives in memory.
+		const coverage: CoverageEntry[] = [];
+		const graphStore = stores.graphStore;
+		stores.graphStore = { ...graphStore, readCoverage: () => [...coverage], appendCoverage: (e) => void coverage.push(e) };
+		const runs: string[] = [];
+		const realRun = extraction.runExtraction;
+		extraction.runExtraction = async (id: string) => {
+			runs.push(id);
+			return undefined as never;
+		};
+		const LONG = (word: string) => Array.from({ length: 5000 }, () => word).join(" "); // ≫ the 4096-token budget
+		const { engine } = scriptedTeacher(() => [
+			() => fauxAssistantMessage([fauxText("Short prose."), fauxToolCall("explain", GRADED_EXPLAIN, { id: "call-g" })], { stopReason: "toolUse" }),
+			() => fauxAssistantMessage([fauxText("OK.")]),
+			() => fauxAssistantMessage([fauxText(LONG("prose"))]),
+		]);
+		const chat = createConfiguredChat("Test: answers never trigger extraction");
+		createdChats.push(chat.id);
+		const tools = { explain: teachExplainToolFor({ chatId: chat.id, chatStore }) };
+		const factory: Parameters<typeof handleChatRequest>[1] = (opts) => createTeacherAgent(undefined, { engine, messages: opts.messages, tools });
+		const env = process.env.NODE_ENV;
+		try {
+			await drainTurn(post(chat.id, { type: "text", text: "teach me" }), factory);
+			// Everything so far is covered: only what the answer turn adds counts.
+			const foldedAt = new Date().toISOString();
+			for (const slot of coverageOf(chatStore.getChat(chat.id)!.messages, [], chat.id).slots) {
+				if (slot.tokens > 0) coverage.push({ chatId: chat.id, fp: slot.fp, tokens: slot.tokens, foldedAt });
+			}
+			(process.env as Record<string, string>).NODE_ENV = "development";
+			graderModelOverride.current = scriptedGrader([verdictCall(["present", "absent", "absent"])]).engine;
+			const pending = danglingQuestionOf(chatStore.getChat(chat.id)!.messages)!;
+			const qd = questionDataFor("explain", pending.toolCallId, parseExplainInput(pending.input)!, { now: new Date().toISOString() });
+			const answer = buildAnswer(qd, { text: LONG("answer"), thinking: LONG("thinking"), confidence: 70, confidenceTouched: true }, "explain");
+			await drainTurn(post(chat.id, { type: "answer", toolCallId: "call-g", answer }), factory);
+			assert.deepEqual(runs, [], "a long answer, its thinking and a short reaction open no run");
+
+			// The control: long teacher prose does reach the trigger.
+			await drainTurn(post(chat.id, { type: "text", text: "go on" }), factory);
+			assert.deepEqual(runs, [chat.id], "teacher prose over the budget starts a run");
+		} finally {
+			(process.env as Record<string, string | undefined>).NODE_ENV = env;
+			graderModelOverride.current = undefined;
+			extraction.runExtraction = realRun;
+			stores.graphStore = graphStore;
+		}
+	});
+
+	it("a duplicate submit of a deferred sibling answer, arriving while it is graded, never calls the grader twice", async () => {
+		const ASK = { question: "Which topic next?", options: [{ label: "Chemistry" }, { label: "History" }] };
+		const { engine } = scriptedTeacher(() => [
+			() =>
+				fauxAssistantMessage(
+					[fauxToolCall("explain", GRADED_EXPLAIN, { id: "call-g" }), fauxToolCall("ask_user_question", ASK, { id: "call-2" })],
+					{ stopReason: "toolUse" },
+				),
+		]);
+		const chat = createConfiguredChat("Test: duplicate deferred graded explain");
+		createdChats.push(chat.id);
+		const tools = { ...bareQuestionTools(), explain: teachExplainToolFor({ chatId: chat.id, chatStore }) };
+		const factory: Parameters<typeof handleChatRequest>[1] = (opts) => createTeacherAgent(undefined, { engine, messages: opts.messages, tools });
+		await drainTurn(post(chat.id, { type: "text", text: "two at once" }), factory);
+		const pending = danglingQuestionOf(chatStore.getChat(chat.id)!.messages)!;
+		const qd = questionDataFor("explain", pending.toolCallId, parseExplainInput(pending.input)!, { now: new Date().toISOString() });
+		const answer = buildAnswer(qd, { text: LEARNER_TEXT }, "explain");
+
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => (release = resolve));
+		let graderCalls = 0;
+		const grader = scriptedGrader([
+			(async () => {
+				graderCalls++;
+				await gate;
+				return fauxAssistantMessage([fauxToolCall("submit_verdict", verdictCall(["present", "present", "absent"]) as never)], { stopReason: "toolUse" });
+			}) as unknown as FauxResponseStep,
+			(() => {
+				graderCalls++;
+				return fauxAssistantMessage([fauxToolCall("submit_verdict", verdictCall(["absent", "absent", "absent"]) as never)], { stopReason: "toolUse" });
+			}) as unknown as FauxResponseStep,
+		]);
+		graderModelOverride.current = grader.engine;
+		try {
+			const first = handleChatRequest(post(chat.id, { type: "answer", toolCallId: "call-g", answer }), factory);
+			await waitFor(() => graderCalls === 1, 8000, "the first grade to start");
+			const duplicate = await handleChatRequest(post(chat.id, { type: "answer", toolCallId: "call-g", answer }), factory);
+			assert.equal(duplicate.status, 409, "the duplicate is refused while the first is graded");
+			release();
+			assert.equal((await first).status, 200);
+		} finally {
+			release();
+			graderModelOverride.current = undefined;
+		}
+		assert.equal(graderCalls, 1, "the grader ran once");
+		const results = chatStore.getChat(chat.id)!.messages.filter((m) => (m as { toolCallId?: string }).toolCallId === "call-g");
+		assert.equal(results.length, 1, "one answer saved");
+		assert.equal((results[0] as { details: Record<string, any> }).details.verdict?.points?.[0]?.status, "present");
+	});
+});
+
+// ─── recognition and prediction answers as evidence (#10) ──────────────────
+describe("recognition and prediction answers become answer entries (#10)", () => {
+	/** Pose `quizInput` as call-1, answer it with `answerReq` (after
+	 *  `tamper` edits the client's record), return the chat and its entry. */
+	async function poseAndAnswerChoice(
+		quizInput: typeof QUIZ_INPUT,
+		answerReq: Parameters<typeof buildAnswer>[1],
+		tamper: (answer: ReturnType<typeof buildAnswer>) => void = () => {},
+	) {
+		const { engine } = scriptedTeacher(() => [
+			() => fauxAssistantMessage([fauxText("Quick check."), fauxToolCall("quiz", quizInput, { id: "call-1" })], { stopReason: "toolUse" }),
+			() => fauxAssistantMessage([fauxText("Noted.")]),
+		]);
+		const chat = createConfiguredChat("Test: recognition evidence");
+		createdChats.push(chat.id);
+		await drainTurn(post(chat.id, { type: "text", text: "teach me the planets" }), agentFactory(engine));
+		const pending = danglingQuestionOf(chatStore.getChat(chat.id)!.messages)!;
+		const qd = questionDataFor("quiz", pending.toolCallId, parseQuizInput(pending.input)!, { now: new Date().toISOString() });
+		const answer = buildAnswer(qd, answerReq, "quiz");
+		tamper(answer);
+		await drainTurn(post(chat.id, { type: "answer", toolCallId: "call-1", answer }), agentFactory(engine));
+		const messages = chatStore.getChat(chat.id)!.messages;
+		const entry = evidenceLines.find((e): e is AnswerEntry => e.type === "answer" && e.chatId === chat.id);
+		return { chatId: chat.id, messages, entry };
+	}
+
+	it("a recognition answer entry carries correctness, kind, phase, confidence with the untouched flag, and thinking", async () => {
+		const { chatId, messages, entry } = await poseAndAnswerChoice(QUIZ_INPUT, {
+			values: ["Venus"],
+			confidence: 90,
+			confidenceTouched: true,
+			thinking: "LEARNER-THINKING-ON-CHOICE",
+		});
+		assert.ok(entry, "an answer entry was written");
+		const asking = messages.find((m) => m.role === "assistant" && m.content.some((b) => b.type === "toolCall" && b.id === "call-1"))!;
+		const result = messages.find((m) => m.role === "toolResult")!;
+		const { at, ...rest } = entry;
+		assert.ok(!Number.isNaN(Date.parse(at)), "timestamped");
+		assert.deepEqual(rest, {
+			type: "answer",
+			toolCallId: "call-1",
+			chatId,
+			questionMessageId: asking.id,
+			answerMessageId: result.id,
+			kind: "recognition",
+			phase: "probe", // no probe_done in this chat
+			dontKnow: false,
+			correct: false,
+			confidence: 90,
+			confidenceTouched: true,
+			thinking: "LEARNER-THINKING-ON-CHOICE",
+		});
+	});
+
+	it("correctness is recomputed on the server from the call's committed correct answer, never trusted from the client", async () => {
+		const lied = await poseAndAnswerChoice(QUIZ_INPUT, { values: ["Mars"], confidence: 50, confidenceTouched: false }, (a) => {
+			a.correct = true;
+		});
+		assert.equal(lied.entry?.correct, false, "a client claiming a wrong pick correct is overruled");
+		const right = await poseAndAnswerChoice(QUIZ_INPUT, { values: ["Mercury"], confidence: 50, confidenceTouched: false }, (a) => {
+			a.correct = false;
+		});
+		assert.equal(right.entry?.correct, true, "a right pick is correct whatever the client says");
+		assert.equal(right.entry?.confidenceTouched, false, "the untouched flag rides through");
+	});
+
+	it("a prediction answer entry is kind prediction; \"I don't know\" is recorded as not correct, with no confidence", async () => {
+		const { entry } = await poseAndAnswerChoice({ ...QUIZ_INPUT, type: "predict" }, { dontKnow: true });
+		assert.ok(entry, "an answer entry was written");
+		assert.equal(entry.kind, "prediction");
+		assert.equal(entry.dontKnow, true);
+		assert.equal(entry.correct, false);
+		assert.equal(entry.confidence, undefined);
+		assert.equal(entry.verdict, undefined, "multiple choice never goes through the grader");
 	});
 });

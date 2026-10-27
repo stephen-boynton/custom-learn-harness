@@ -6,6 +6,7 @@
  * master. Pure types + protocol docs + tiny pure helpers. See docs/vision.md.
  */
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
+import type { Usage } from "@earendil-works/pi-ai";
 import type { LhMessage } from "../native-messages.ts";
 import type { Phase3 } from "../phases.ts";
 import type { PlanNodeStatus, PlanTree } from "./plan.ts";
@@ -131,6 +132,22 @@ export interface CallUsage {
 	cacheWrite1hTokens?: number;
 	/** The reasoning portion of the output tokens. */
 	reasoningTokens: number | undefined;
+}
+
+/** pi's per-step usage, flattened to the persisted CallUsage fields (the
+ *  money channel's capture shape) — shared by every capture site
+ *  (extraction stages, the grader). Pure projection. */
+export function callUsage(usage: Usage): CallUsage {
+	return {
+		inputTokens: usage.input,
+		outputTokens: usage.output,
+		cacheReadTokens: usage.cacheRead,
+		cacheWriteTokens: usage.cacheWrite,
+		cacheWrite1hTokens: usage.cacheWrite1h ?? 0,
+		// Optional in pi's Usage (providers that never emit reasoning
+		// tokens leave it unset) — persisted as 0, never dropped.
+		reasoningTokens: usage.reasoning ?? 0,
+	};
 }
 
 /** One billing turn: one full invocation of the teacher (a client turn or a

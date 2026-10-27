@@ -22,6 +22,7 @@ import type {
 	PlanTree,
 	Position,
 	CoverageEntry,
+	EvidenceEntry,
 	SessionCheckpoint,
 	TurnUsage,
 	NotesSource,
@@ -92,6 +93,16 @@ export interface GraphStore {
 	 *  checkpoint — "uncovered" is derived from these, never tracked. */
 	appendCoverage(entry: CoverageEntry): void;
 	readCoverage(): CoverageEntry[];
+
+	/** The evidence ledger (spec #2, ADR-0002): answer, attribution and
+	 *  attribution-run entries, append-only. Never rewritten — deliberately
+	 *  absent from rewriteLedgers. One writer per file: answers come only
+	 *  from the chat handler, attributions and runs only from the merger.
+	 *  Held status is derived from it on read (core/evidence.ts), never
+	 *  stored. */
+	appendEvidence(entry: EvidenceEntry): void;
+	/** Raw evidence lines in append order. */
+	readEvidence(): EvidenceEntry[];
 
 	/** Append one cluster-naming run's usage (graph-global money channel) —
 	 *  idempotent per startedAt. */

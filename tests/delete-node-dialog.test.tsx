@@ -17,15 +17,19 @@ import { createElement } from "react";
  * semantics evolve (rewiring talk is on the table). Title + names +
  * one permanence line + Cancel/Delete. And "node"/"nodes" is THE UI
  * word for graph objects (standardized everywhere, same ruling).
+ *
+ * The EVIDENCE LINE (spec #2 / #12, owner 2026-10-27) adds one fact back
+ * — how much evidence the deletion orphans — read off the graph snapshot
+ * the caller already holds, so still NO fetch and no flicker.
  */
 
 import { DeleteNodeBody, DeleteNodeDialog, EXTRACTION_RETRY_LINE } from "../components/delete-node-dialog.tsx";
 
 /** The body — pure, so SSR pins everything the live dialog shows. */
-function bodyAt(nodes: { id: string; name: string }[], extra?: { failure?: { code: string; error: string } | null; busy?: boolean }) {
+function bodyAt(nodes: { id: string; name: string; evidenceCount?: number }[], extra?: { failure?: { code: string; error: string } | null; busy?: boolean }) {
 	return renderToStaticMarkup(
 		createElement(DeleteNodeBody, {
-			nodes,
+			nodes: nodes.map((n) => ({ evidenceCount: 0, ...n })),
 			busy: extra?.busy ?? false,
 			failure: extra?.failure ?? null,
 			onClose: () => {},
@@ -42,7 +46,7 @@ describe("EXTRACTION_RETRY_LINE (the 409 phrasing, owner-locked)", () => {
 
 describe("DeleteNodeDialog (thin SSR)", () => {
 	it("null and empty nodes both render nothing — closed either way", () => {
-		for (const nodes of [null, []] as ({ id: string; name: string }[] | null)[]) {
+		for (const nodes of [null, []] as ({ id: string; name: string; evidenceCount: number }[] | null)[]) {
 			const html = renderToStaticMarkup(
 				createElement(DeleteNodeDialog, { nodes, onClose: () => {}, onDeleted: () => {} }),
 			);
@@ -125,5 +129,26 @@ describe("DeleteNodeBody — the minimal screen (owner, 2026-09-30)", () => {
 		assert.match(html, /Deleting…</);
 		assert.match(html, /data-testid="node-delete-cancel"[^>]*disabled/);
 		assert.match(html, /data-testid="node-delete-confirm"[^>]*disabled/);
+	});
+});
+
+describe("DeleteNodeBody — the evidence line (#12, owner 2026-10-27)", () => {
+	const line = (html: string) => /data-testid="node-evidence-line"[^>]*>([^<]*)</.exec(html)?.[1];
+
+	it("single: how many pieces of evidence the node carries — none, one, many", () => {
+		assert.equal(line(bodyAt([{ id: "kepler", name: "Kepler's three laws", evidenceCount: 0 }])), "This node carries no evidence.");
+		assert.equal(line(bodyAt([{ id: "kepler", name: "Kepler's three laws", evidenceCount: 1 }])), "This node carries 1 piece of evidence.");
+		assert.equal(line(bodyAt([{ id: "kepler", name: "Kepler's three laws", evidenceCount: 4 }])), "This node carries 4 pieces of evidence.");
+	});
+
+	it("multi: the selection's total", () => {
+		const three = bodyAt([
+			{ id: "kepler", name: "Kepler's three laws", evidenceCount: 2 },
+			{ id: "newton", name: "Newton's second law", evidenceCount: 5 },
+			{ id: "hook", name: "Hooke's law", evidenceCount: 0 },
+		]);
+		assert.equal(line(three), "These 3 nodes carry 7 pieces of evidence.");
+		assert.equal(line(bodyAt([{ id: "a", name: "A" }, { id: "b", name: "B", evidenceCount: 1 }])), "These 2 nodes carry 1 piece of evidence.");
+		assert.equal(line(bodyAt([{ id: "a", name: "A" }, { id: "b", name: "B" }])), "These 2 nodes carry no evidence.");
 	});
 });
